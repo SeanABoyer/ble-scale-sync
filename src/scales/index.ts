@@ -15,6 +15,7 @@ import { SoehnleScaleAdapter } from './soehnle.js';
 import { MedisanaBs44xAdapter } from './medisana-bs44x.js';
 import { TrisaAdapter } from './trisa.js';
 import { EsCs20mAdapter } from './es-cs20m.js';
+import { HumeBodyPodAdapter } from './hume.js';
 
 import { ExingtechY1Adapter } from './exingtech-y1.js';
 import { ExcelvanCF369Adapter } from './excelvan-cf369.js';
@@ -34,6 +35,7 @@ import { SalterAdapter } from './salter.js';
 import { StandardGattScaleAdapter } from './standard-gatt.js';
 import { registerExclusionRegistry } from './derived-excludes.js';
 
+
 export const adapters: ScaleAdapter[] = [
   // Specific adapters first — they match by device name before the generic one.
   // Order matters: SenssunAdapter before QnScaleAdapter (QN matches 'senssun'),
@@ -44,6 +46,7 @@ export const adapters: ScaleAdapter[] = [
   new SenssunAdapter(),
   new QnScaleAdapter(),
   new RenphoScaleAdapter(),
+  new HumeBodyPodAdapter(),
   // Renpho R-MSC04 (#117/#265): 55AA-framed weight on service 0x1A10. Matched by
   // its exact advertised name only. It outranks ES-CS20M (which claims 0x1A10)
   // so a named R-MSC04 lands here, while a nameless 0x1A10 device still goes to
