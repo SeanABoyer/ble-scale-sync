@@ -12,6 +12,21 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      # Publishing to npm uses trusted publishing (OIDC), so there is no token
+      # to detect. The gate is a repository variable the maintainer sets once,
+      # AFTER the package exists on npm and its Trusted Publisher is configured:
+      # a trusted publisher can only be configured in an existing package's
+      # settings, so the very first publish is a manual one. Without this gate
+      # the first release would fail the job rather than skip it.
+      # It is computed here rather than in `jobs.<id>.if` to keep the same shape
+      # as the release outputs above.
+      npm_publish_enabled: ${{ vars.NPM_PUBLISH_ENABLED == 'true' }}
+      # The open release PR branch, empty when there is none. Set by the add-on
+      # sync step once the branch is validated.
+      release_branch: ${{ steps.addon_sync.outputs.branch }}
     steps:
       # Token strategy:
       # - `RELEASE_PLEASE_TOKEN` (optional PAT with `repo` + `workflow` scopes)
@@ -23,7 +38,8 @@ jobs:
       # - Falls back to GITHUB_TOKEN so the workflow keeps working out of
       #   the box; maintainer can then re-run ci.yml / trigger docker.yml
       #   manually until the PAT is configured.
-      - uses: googleapis/release-please-action@v5
+      # Pinned to a commit: this step receives RELEASE_PLEASE_TOKEN.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -43,18 +59,45 @@ jobs:
         with:
           node-version: 24
 
+      # The branch is the one release-please just created or updated (its `pr`
+      # output), not the first `release-please--*` branch on the remote: a
+      # leftover branch from an earlier configuration would sort first and get
+      # the sync commit instead. When this run left the release PR unchanged
+      # the output is unset; the open release PR is then looked up by its
+      # label, so a sync that failed on an earlier run still gets redone.
       - name: Sync the add-on changelog on the release PR
+        id: addon_sync
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
         run: |
           set -euo pipefail
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo-sync
-          cd repo-sync
-          BRANCH=$(git ls-remote --heads origin 'release-please--*' | awk '{print $2}' | sed 's#refs/heads/##' | head -1)
+          if [ -n "$RELEASE_PR" ]; then
+            BRANCH=$(printf '%s' "$RELEASE_PR" | jq -r '.headBranchName // empty')
+          else
+            OPEN=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+              --label 'autorelease: pending' --json headRefName --jq '.[].headRefName')
+            COUNT=$(printf '%s\n' "$OPEN" | grep -c . || true)
+            if [ "$COUNT" -gt 1 ]; then
+              echo "::warning::More than one open release PR, not syncing: $(printf '%s' "$OPEN" | tr '\n' ' ')"
+              exit 0
+            fi
+            BRANCH="$OPEN"
+          fi
           if [ -z "$BRANCH" ]; then
-            echo "No release-please branch, nothing to sync."
+            echo "No release PR, nothing to sync."
             exit 0
           fi
+          case "$BRANCH" in
+            release-please--*) ;;
+            *)
+              echo "::error::Unexpected release PR branch '$BRANCH'"
+              exit 1
+              ;;
+          esac
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo-sync
+          cd repo-sync
           # Explicit refspec: a shallow clone has no remote-tracking ref for
           # this branch, and a plain `fetch <branch>` only writes FETCH_HEAD.
           # `checkout -B` rather than `switch --track`, because a ref fetched
@@ -71,3 +114,118 @@ jobs:
           git add ble-scale-sync-addon/CHANGELOG.md
           git commit -m 'chore(addon): sync the add-on changelog from the project changelog'
           git push origin "HEAD:$BRANCH"
+
+  # The README contributors grid is generated from git history by
+  # src/tools/sync-contributors.ts. It is regenerated here, on the release PR
+  # branch, and not on every push to dev: the owner's own count moves with
+  # every commit, so a push-triggered job would add a bot commit after nearly
+  # every push and reject the next local push. The README people see is the
+  # one on main, which only changes at a release anyway.
+  # A job of its own, so an API outage or an unresolved identity fails only
+  # this job, never the release or npm-publish.
+  readme-contributors:
+    needs: release-please
+    if: needs.release-please.outputs.release_branch != ''
+    runs-on: ubuntu-latest
+    # A job-level block replaces the workflow-level one. contents: write only
+    # matters for the GITHUB_TOKEN fallback push below.
+    permissions:
+      contents: write
+    concurrency:
+      group: readme-contributors
+      cancel-in-progress: false
+    steps:
+      # The release-please token, as in the add-on sync: a commit pushed with
+      # GITHUB_TOKEN does not run ci.yml on the release PR without a manual
+      # approval, so its head commit would carry no required checks.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.release_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # TypeScript run straight off source with no install, like the add-on sync.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Regenerate the contributors grid
+        env:
+          # Read-only REST lookups (1,000 requests per hour per repository).
+          # Never the release-please token: the generator writes nothing remote.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ needs.release-please.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD)
+          status=0
+          node src/tools/sync-contributors.ts write || status=$?
+          # 0: done. 3: written, but an identity could not be resolved and is
+          # left out; the job still fails at the end so it gets noticed.
+          # Anything else wrote nothing.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then exit "$status"; fi
+          if git diff --quiet -- README.md; then
+            echo "Contributors grid already current."
+            exit "$status"
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'chore(readme): regenerate the contributors grid'
+          # The lease pins the branch to the commit this job read. A plain push
+          # would recreate the branch if the release PR was merged (and the
+          # branch auto-deleted) while this job ran.
+          git push --force-with-lease="refs/heads/$BRANCH:$base" origin "HEAD:refs/heads/$BRANCH"
+          exit "$status"
+
+  npm-publish:
+    needs: release-please
+    # Job outputs are strings: compare against "true", never rely on
+    # truthiness. Until the maintainer sets the NPM_PUBLISH_ENABLED repository
+    # variable the whole job shows as skipped instead of failing, which is what
+    # has to happen for every release before the package exists on npm.
+    if: >-
+      needs.release-please.outputs.release_created == 'true' &&
+      needs.release-please.outputs.npm_publish_enabled == 'true'
+    runs-on: ubuntu-latest
+    # A job-level permissions block REPLACES the workflow-level one, so the
+    # release-please job above keeps contents:write / pull-requests:write and
+    # only this job gets the OIDC token. id-token: write is what both trusted
+    # publishing and provenance need; there is no npm token anywhere.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm >= 11.5.1, and Node 22 still bundles
+      # npm 10.x. Pinned to an exact version: this job holds the OIDC token
+      # the registry accepts as the package's publisher, so a newly published
+      # npm must not run here without an edit to this line. Dependabot does
+      # not see this pin; move it by hand (any 11.x from 11.5.1 up).
+      - name: Use an npm that can publish through OIDC
+        run: npm install -g npm@11.20.0
+
+      # Full install (dev included): prepublishOnly runs `npm run build`, which
+      # needs typescript. --ignore-scripts keeps the native BLE stacks from
+      # compiling here; the tarball only carries the compiled dist/.
+      # Do NOT add --omit=optional: three type-only imports make the stacks a
+      # hard requirement for tsc.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # No NODE_AUTH_TOKEN: the registry authenticates this run through the
+      # trusted publisher configured for the package (repository plus this
+      # workflow filename, both case sensitive). --ignore-scripts is never
+      # passed here, or prepublishOnly would not run and the tarball would ship
+      # without dist/.
+      - name: Publish to npm
+        run: npm publish --provenance --access public

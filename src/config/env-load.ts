@@ -1,16 +1,31 @@
+import { dirname } from 'node:path';
 import { config as dotenvConfig } from 'dotenv';
-import type { AppConfig, ExporterEntry } from './schema.js';
-import { DEFAULT_ENV_PATH } from './paths.js';
+import { RuntimeSchema, type AppConfig, type ExporterEntry } from './schema.js';
+import { defaultEnvPath } from './paths.js';
 import { parseBleAdapterEnv } from './env-overrides.js';
 import { loadConfig as loadEnvVarConfig } from '../validate-env.js';
 import { loadExporterConfig } from '../exporters/config.js';
+import { resolveTokenDir } from './token-dirs.js';
 
 /**
  * Load config from .env, wrapping existing loadConfig() + loadExporterConfig()
  * into the unified AppConfig shape.
  */
+/**
+ * NOBLE_DRIVER for the legacy .env mode. It used to be cast to the union
+ * unchecked, so a typo reached the driver selection as if it were valid (G-22).
+ */
+function parseNobleDriverEnv(): 'abandonware' | 'stoprocent' | null {
+  const raw = process.env.NOBLE_DRIVER?.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === 'abandonware' || raw === 'stoprocent') return raw;
+  throw new Error(
+    `NOBLE_DRIVER must be 'abandonware' or 'stoprocent', got '${process.env.NOBLE_DRIVER}'`,
+  );
+}
+
 export function loadEnvConfig(): AppConfig {
-  dotenvConfig({ path: DEFAULT_ENV_PATH });
+  dotenvConfig({ path: defaultEnvPath(), quiet: true });
 
   const envConfig = loadEnvVarConfig();
   const exporterConfig = loadExporterConfig();
@@ -19,6 +34,31 @@ export function loadEnvConfig(): AppConfig {
   const globalExporters: ExporterEntry[] = exporterConfig.exporters.map((name) => {
     const entry: Record<string, unknown> = { type: name };
 
+    if (name === 'garmin' && exporterConfig.garmin) {
+      Object.assign(entry, {
+        weight_only: exporterConfig.garmin.weightOnly,
+        // undefined when GARMIN_UPLOAD_TIMEOUT_SEC is unset, which the
+        // exporter reads as "use the default", same as an absent YAML key.
+        upload_timeout_sec: exporterConfig.garmin.uploadTimeoutSec,
+      });
+    }
+    if (name === 'file' && exporterConfig.file) {
+      const f = exporterConfig.file;
+      Object.assign(entry, {
+        file_path: f.filePath,
+        format: f.format,
+      });
+    }
+    if (name === 'strava' && exporterConfig.strava) {
+      const s = exporterConfig.strava;
+      Object.assign(entry, {
+        client_id: s.clientId,
+        client_secret: s.clientSecret,
+        // Relative to the directory the .env is in, like a token_dir in
+        // config.yaml (F-11).
+        token_dir: resolveTokenDir(s.tokenDir, dirname(defaultEnvPath())),
+      });
+    }
     if (name === 'mqtt' && exporterConfig.mqtt) {
       const m = exporterConfig.mqtt;
       Object.assign(entry, {
@@ -95,6 +135,22 @@ export function loadEnvConfig(): AppConfig {
         sync_measurements: w.syncMeasurements,
       });
     }
+    if (name === 'healthlog' && exporterConfig.healthlog) {
+      const h = exporterConfig.healthlog;
+      Object.assign(entry, {
+        base_url: h.baseUrl,
+        token: h.token,
+        sync_measurements: h.syncMeasurements,
+      });
+    }
+    if (name === 'dreeve' && exporterConfig.dreeve) {
+      const d = exporterConfig.dreeve;
+      Object.assign(entry, {
+        base_url: d.baseUrl,
+        token: d.token,
+        unit_system: d.unitSystem,
+      });
+    }
 
     return entry as ExporterEntry;
   });
@@ -107,14 +163,18 @@ export function loadEnvConfig(): AppConfig {
     ble: {
       handler: 'auto' as const,
       scale_mac: envConfig.scaleMac ?? null,
-      noble_driver: (process.env.NOBLE_DRIVER as 'abandonware' | 'stoprocent') ?? null,
+      noble_driver: parseNobleDriverEnv(),
       adapter: parseBleAdapterEnv() ?? null,
     },
     scale: {
       weight_unit: envConfig.weightUnit,
       height_unit: 'cm', // env-var config already converts to cm
+      display_unit: 'weight_unit',
     },
     unknown_user: 'nearest',
+    // Env-var config has one synthetic user with a 0-999 kg range, so the guard
+    // can never fire; the field is here because AppConfig requires it.
+    out_of_range: 'warn',
     users: [
       {
         name: 'Default',
@@ -129,12 +189,13 @@ export function loadEnvConfig(): AppConfig {
     ],
     global_exporters: globalExporters,
     runtime: {
+      ...RuntimeSchema.parse({}),
       continuous_mode: envConfig.continuousMode,
       scan_cooldown: envConfig.scanCooldownSec,
       dry_run: envConfig.dryRun,
-      debug: process.env.DEBUG === 'true',
-      watchdog_max_consecutive_failures: 10,
-      watch_config: true,
+      // Same TRUE words as the logger and the yaml override, so DEBUG=1 does
+      // not mean debug logs on but runtime.debug off.
+      debug: ['true', 'yes', 'on', '1'].includes((process.env.DEBUG ?? '').trim().toLowerCase()),
     },
     update_check: true,
   };

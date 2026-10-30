@@ -49,6 +49,13 @@ const WEIGHT_OFFSET = 5;
 const WEIGHT_BYTES = 3;
 const WEIGHT_DIV = 1000;
 
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class RobiS9Session {
+  cachedWeight = 0;
+  cachedImpedance = 0;
+  final = false;
+}
+
 /**
  * Adapter for the Robi S9 smart scale (Fitdays app, Lefu-style FFB0 protocol).
  *
@@ -76,7 +83,6 @@ export class RobiS9Adapter implements ScaleAdapterCore, GattWiring, MultiCharNot
   // Legacy single-char fields (unused in multi-char mode).
   readonly charNotifyUuid = CHR_FFB2;
   readonly charWriteUuid = CHR_FFB1;
-  readonly normalizesWeight = true;
 
   // FFB3 is physically an indicate characteristic, but the shared subscribe loop
   // only auto-subscribes bindings of type 'notify'. node-ble/noble enable
@@ -88,9 +94,7 @@ export class RobiS9Adapter implements ScaleAdapterCore, GattWiring, MultiCharNot
     { uuid: CHR_FFB3, type: 'notify' },
   ];
 
-  private cachedWeight = 0;
-  private cachedImpedance = 0;
-  private final = false;
+  private s = new RobiS9Session();
 
   matches(device: BleDeviceInfo): boolean {
     const name = (device.localName || '').toLowerCase();
@@ -118,10 +122,11 @@ export class RobiS9Adapter implements ScaleAdapterCore, GattWiring, MultiCharNot
     return hasFfb0 && hasFfb3;
   }
 
+  onSessionStart(): void {
+    this.s = new RobiS9Session();
+  }
+
   async onConnected(ctx: ConnectionContext): Promise<void> {
-    this.cachedWeight = 0;
-    this.cachedImpedance = 0;
-    this.final = false;
     for (const hex of HANDSHAKE) {
       await ctx.write(CHR_FFB1, Buffer.from(hex, 'hex'), true);
       await new Promise((r) => setTimeout(r, 150));
@@ -139,18 +144,18 @@ export class RobiS9Adapter implements ScaleAdapterCore, GattWiring, MultiCharNot
     if (data[3] === 0xa3) {
       const w = data.readUIntBE(WEIGHT_OFFSET, WEIGHT_BYTES) / WEIGHT_DIV;
       if (w > 0 && Number.isFinite(w)) {
-        this.cachedWeight = w;
+        this.s.cachedWeight = w;
         // Impedance offset is not yet decoded: the only captured A3 frame has
         // all-zero bytes after the weight. Emit 0 (BIA fallback) rather than a
         // guessed offset that could surface garbage; pin it from a future
         // known-impedance DEBUG capture (#248).
-        this.cachedImpedance = 0;
-        this.final = true;
+        this.s.cachedImpedance = 0;
+        this.s.final = true;
       }
     }
 
-    if (this.final && this.cachedWeight > 0) {
-      return { weight: this.cachedWeight, impedance: this.cachedImpedance };
+    if (this.s.final && this.s.cachedWeight > 0) {
+      return { weight: this.s.cachedWeight, impedance: this.s.cachedImpedance };
     }
     return null;
   }
@@ -161,12 +166,19 @@ export class RobiS9Adapter implements ScaleAdapterCore, GattWiring, MultiCharNot
   }
 
   isComplete(reading: ScaleReading): boolean {
-    return reading.weight > 0 && this.final;
+    return reading.weight > 0 && this.s.final;
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    // Body composition via BIA from weight + impedance; the vendor's own
-    // body-comp frames are scrambled and not decoded.
+    // NOT BIA, despite what this comment used to say. `parseCharNotification`
+    // emits `impedance: 0` on purpose: the only captured A3 frame has all-zero
+    // bytes after the weight, so there is no impedance offset to read yet
+    // (#248). The vendor's own body-comp frames are scrambled and not decoded
+    // either, so body composition here is the Deurenberg BMI estimate and will
+    // stay that way until someone posts a capture with a known impedance.
+    //
+    // Listed in #386 as an adapter that reads an impedance and ignores it. It
+    // does not read one.
     return buildPayload(reading.weight, reading.impedance, {}, profile);
   }
 }

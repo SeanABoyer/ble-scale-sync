@@ -1,14 +1,9 @@
-import type { ScaleAdapter, ScaleReading } from '../../interfaces/scale-adapter.js';
+import type { ScaleAdapter, ScaleReading, LiveWeight } from '../../interfaces/scale-adapter.js';
 import type { RawReading } from '../shared.js';
 import { bleLog, sleep, errMsg, DISCOVERY_TIMEOUT_MS, IMPEDANCE_GRACE_MS } from '../types.js';
-import {
-  helperOf,
-  getDbusNext,
-  type PropsChangedHandler,
-  type Adapter,
-  type Device,
-} from './dbus.js';
+import { helperOf, type PropsChangedHandler, type Adapter, type Device } from './dbus.js';
 import { isDeviceObjectGone } from './device-object.js';
+import { dbusErrorType } from './connection.js';
 
 /** Extract a Buffer from a D-Bus value that may be a Variant wrapper, Buffer, Uint8Array, or number[]. */
 export function extractDbusBytes(val: unknown): Buffer | null {
@@ -51,23 +46,21 @@ export async function broadcastScanNodeBle(
   btAdapter: Adapter,
   device: Device,
   mac: string,
-  opts: { abortSignal?: AbortSignal; onLiveData?: (r: ScaleReading) => void },
+  opts: {
+    abortSignal?: AbortSignal;
+    onLiveData?: (r: ScaleReading) => void;
+    onLiveWeight?: (live: LiveWeight) => void;
+  },
 ): Promise<RawReading> {
-  const { abortSignal, onLiveData } = opts;
+  const { abortSignal, onLiveData, onLiveWeight } = opts;
 
-  // Tell BlueZ to report duplicate advertisements so ServiceData is refreshed
-  // on every packet from the scale, not just on first discovery.
-  try {
-    const { Variant } = await getDbusNext();
-    const adapterHelper = helperOf(btAdapter);
-    await adapterHelper.callMethod('SetDiscoveryFilter', {
-      Transport: new Variant('s', 'le'),
-      DuplicateData: new Variant('b', true),
-    });
-    bleLog.debug('Discovery filter: DuplicateData=true');
-  } catch (err: unknown) {
-    bleLog.debug(`SetDiscoveryFilter: ${errMsg(err)} (non-fatal, will poll)`);
-  }
+  // The duplicate filter is set in startDiscoverySafe, BEFORE StartDiscovery,
+  // because that is the only point at which BlueZ applies it to the scan it is
+  // about to run. It used to be set here instead, which is after the scan is
+  // already running and after the device has been found, so it never took and
+  // a broadcast scale looked frozen (#372). Left as a comment rather than a
+  // second call: repeating it here would look like belt and braces while
+  // actually doing nothing.
 
   bleLog.info(
     'Adapter prefers passive mode. Listening for broadcast weight data. Step on the scale.',
@@ -187,6 +180,13 @@ export async function broadcastScanNodeBle(
         if (wantedCompanyId !== undefined && Number(key) !== wantedCompanyId) continue;
         const reading = adapter.parseBroadcast(buf);
         if (reading && consume(reading)) return true;
+        // Only once parseBroadcast has declined the frame, so one advertisement
+        // is never reported through both channels (#356). A settling weight is
+        // not a reading and never ends the scan.
+        if (!reading && adapter.parseLiveBroadcast && onLiveWeight) {
+          const live = adapter.parseLiveBroadcast(buf);
+          if (live) onLiveWeight(live);
+        }
       }
       return false;
     };
@@ -212,36 +212,78 @@ export async function broadcastScanNodeBle(
     // the PropertiesChanged subscription is established).
     const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
     (async () => {
-      while (!done && Date.now() < deadline) {
+      // Past the deadline the loop keeps going only while a weight-only reading
+      // is waiting out its grace, so a complete frame can still resolve it with
+      // the impedance. The grace timer ends that wait itself, at most
+      // IMPEDANCE_GRACE_MS after the reading was first held (#357, see
+      // armScanDeadline for the same rule on the other transports).
+      let deadlineLogged = false;
+      let droppedLogged = false;
+      /** Reset the one-shot "device dropped" log once a read succeeds again. */
+      const noteDeviceBack = (): void => {
+        if (!droppedLogged) return;
+        droppedLogged = false;
+        bleLog.debug('BlueZ lists the device again');
+      };
+      while (!done && (Date.now() < deadline || graceTimer !== null)) {
+        if (!deadlineLogged && Date.now() >= deadline) {
+          deadlineLogged = true;
+          bleLog.info(
+            'Scan deadline reached while a weight-only reading waits for impedance; ' +
+              'waiting out its grace before reporting it',
+          );
+        }
         if (abortSignal?.aborted) break;
         try {
           const helper = helperOf(device);
-          // Each property is read separately so one failing does not hide the
-          // other, but the rejection is NOT swallowed: BlueZ dropping the
-          // Device1 object is the failure this whole path exists for, and a
-          // silent poll would spin for the full discovery timeout and then
-          // report the generic "no reading" message instead of the real cause.
+          // A rejection is classified below: a dropped Device1 (UnknownObject)
+          // is logged once and polled through, the #297 shapes fail the scan,
+          // and anything else is logged on every poll.
           if (adapter.parseServiceData) {
             const sd: unknown = await helper.prop('ServiceData');
+            noteDeviceBack();
+            // Re-check after every await. This loop is detached: the outer
+            // promise can settle while we are parked here, and the caller's
+            // teardown then hands the device proxy back. A further read would
+            // rebuild it (BusHelper._prepare runs again once removeListeners
+            // has cleared _ready), re-registering the listener and the match
+            // rule that were just released (#396, #397).
+            if (done) break;
             if (tryServiceData(sd)) break;
           }
           if (adapter.parseBroadcast) {
             const md: unknown = await helper.prop('ManufacturerData');
+            noteDeviceBack();
+            if (done) break;
             if (tryManufacturerData(md)) break;
           }
         } catch (err: unknown) {
-          if (isDeviceObjectGone(err)) {
+          if (dbusErrorType(err) === 'org.freedesktop.DBus.Error.UnknownObject') {
+            // BlueZ drops a temporary Device1 object about 30 s after its last
+            // advertisement and recreates it at the same path on the next one.
+            // The cached proxy starts working again (verified against real
+            // BlueZ), so keep polling; log the transition once instead of every
+            // 500 ms. noteDeviceBack resets the flag after the next success.
+            if (!droppedLogged) {
+              droppedLogged = true;
+              bleLog.debug(
+                'BlueZ dropped the device after it went quiet; waiting for it to advertise again',
+              );
+            }
+          } else if (isDeviceObjectGone(err)) {
             fail(
               new Error(
-                `BlueZ removed the device object for ${mac} during the broadcast scan, ` +
-                  `so it is only visible while scanning is active (#297): ${errMsg(err)}`,
+                `BlueZ removed the device object for ${mac} during the broadcast scan: ` +
+                  errMsg(err).trim(),
               ),
             );
             break;
+          } else {
+            bleLog.debug(`Advertisement poll error: ${errMsg(err).trim()}`);
           }
-          bleLog.debug(`Advertisement poll error: ${errMsg(err)}`);
         }
         await sleep(500);
+        if (done) break;
       }
       if (!done) {
         fail(

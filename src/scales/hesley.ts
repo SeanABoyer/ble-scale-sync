@@ -13,6 +13,12 @@ import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
 const CHR_NOTIFY = uuid16(0xfff4);
 const CHR_WRITE = uuid16(0xfff1);
 
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class HesleySession {
+  /** Cached body-composition values from the most recent parsed frame. */
+  cachedComp: ScaleBodyComp = {};
+}
+
 /**
  * Adapter for Hesley / "YunChen" BLE body-fat scales.
  *
@@ -28,13 +34,11 @@ export class HesleyScaleAdapter implements ScaleAdapterCore, GattWiring, Unlocka
   readonly match: MatchDescriptor = { priority: 100, names: { exact: ['yunchen'] } };
   readonly charNotifyUuid = CHR_NOTIFY;
   readonly charWriteUuid = CHR_WRITE;
-  readonly normalizesWeight = true;
   /** Magic init sequence to start measurements. */
   readonly unlockCommand = [0xa5, 0x01, 0x2c, 0xab, 0x50, 0x5a, 0x29];
   readonly unlockIntervalMs = 0;
 
-  /** Cached body-composition values from the most recent parsed frame. */
-  private cachedComp: ScaleBodyComp = {};
+  private s = new HesleySession();
 
   matches(device: BleDeviceInfo): boolean {
     return matchesDescriptor(device, this.match);
@@ -53,7 +57,7 @@ export class HesleyScaleAdapter implements ScaleAdapterCore, GattWiring, Unlocka
    *   [12-13]  bone mass (kg), big-endian uint16 / 10
    *   [14-19]  (remaining bytes)
    */
-  parseNotification(data: Buffer): ScaleReading | null {
+  parseNotification(data: Buffer): ScaleReading<ScaleBodyComp> | null {
     if (data.length < 14) return null;
 
     const weight = data.readUInt16BE(2) / 100;
@@ -64,21 +68,30 @@ export class HesleyScaleAdapter implements ScaleAdapterCore, GattWiring, Unlocka
     const muscle = data.readUInt16BE(10) / 10;
     const bone = data.readUInt16BE(12) / 10;
 
-    this.cachedComp = {
+    this.s.cachedComp = {
       fat: fat > 0 ? fat : undefined,
       water: water > 0 ? water : undefined,
       muscle: muscle > 0 ? muscle : undefined,
       bone: bone > 0 ? bone : undefined,
     };
 
-    return { weight, impedance: 0 };
+    return { weight, impedance: 0, scaleComposition: this.s.cachedComp };
   }
 
   isComplete(reading: ScaleReading): boolean {
     return reading.weight > 0;
   }
 
-  computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    return buildPayload(reading.weight, reading.impedance, this.cachedComp, profile);
+  onSessionStart(): void {
+    this.s = new HesleySession();
+  }
+
+  computeMetrics(reading: ScaleReading<ScaleBodyComp>, profile: UserProfile): BodyComposition {
+    return buildPayload(
+      reading.weight,
+      reading.impedance,
+      reading.scaleComposition ?? this.s.cachedComp,
+      profile,
+    );
   }
 }

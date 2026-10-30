@@ -7,21 +7,66 @@ from pathlib import Path
 from dotenv import load_dotenv
 from garminconnect import Garmin
 
+from garmin_errors import format_error_chain
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
 
 
-def get_token_dir(token_dir=None):
+def config_dir(config_path=None):
+    """The directory config.yaml and .env are read from, as the app picks it.
+
+    Mirrors configDir() and envPathFor() in src/config/paths.ts: the given
+    config's own directory, otherwise the working directory when it holds
+    config.yaml or .env, otherwise the package directory. The .env used to be
+    the package directory's whatever the working directory or --config-path
+    said, which after an npm or npx install is not where the user keeps either
+    file (F-11).
+    """
+    if config_path:
+        return Path(config_path).expanduser().resolve().parent
+    for directory in (Path.cwd(), PROJECT_ROOT):
+        if (directory / "config.yaml").exists() or (directory / ".env").exists():
+            return directory
+    return Path.cwd()
+
+
+def get_token_dir(token_dir=None, base_dir=None):
+    """The token directory to write to.
+
+    A token_dir argument (--token-dir as typed, or one from config.yaml
+    already made absolute) is taken as it is. A relative TOKEN_DIR from the
+    environment is next to config.yaml, `base_dir`, which is where the app
+    looks for it too (findTokenDirCollisions in src/config/token-dirs.ts and
+    the Garmin exporter), not wherever the setup was started (F-11).
+    """
     if token_dir:
         return str(Path(token_dir).expanduser())
     custom = os.environ.get("TOKEN_DIR", "").strip()
     if custom:
-        return str(Path(custom).expanduser())
+        path = Path(custom).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = Path(base_dir) / path
+        return str(path)
     new = Path.home() / ".garmin_tokens"
     old = Path.home() / ".garmin_renpho_tokens"
     if old.is_dir() and not new.is_dir():
         return str(old)
     return str(new)
+
+
+def resolve_config_token_dir(token_dir, config_path):
+    """A token_dir from config.yaml, with a relative path taken from the
+    directory config.yaml is in (F-11).
+
+    The uploader gets the same absolute path from the Node side, so setup and
+    upload agree whatever directory either was started from. Resolving it
+    against the working directory put the token next to wherever setup ran,
+    and the uploader (cwd = package directory) then found none.
+    """
+    expanded = Path(token_dir).expanduser()
+    if expanded.is_absolute():
+        return str(expanded)
+    return str(Path(config_path).resolve().parent / expanded)
 
 
 def cleanup_legacy_tokens(token_dir):
@@ -47,13 +92,43 @@ def cleanup_legacy_tokens(token_dir):
                 print(f"[Setup] Warning: failed to remove {f.name}: {e}")
 
 
+def login_fresh(garmin):
+    """Log in with credentials, ignoring any cached token.
+
+    ``Garmin.login(tokenstore)`` loads an existing token file first and, when
+    that load succeeds, skips the credential login entirely. A stale token
+    therefore reaches the profile fetch, gets a 401, and surfaces as
+    "Failed to retrieve social profile" -- with the email and password never
+    sent and the MFA prompt never reached. That is fatal here, because minting
+    a fresh token is this script's whole job.
+
+    garminconnect 0.3.16 recovers from a rejected cache by discarding it and
+    re-running the login, but only when ``return_on_mfa`` is False, and we
+    need ``return_on_mfa=True`` to prompt for the 2FA code. So bypass the
+    cache here instead: call ``login()`` with no tokenstore, and hide
+    ``GARMINTOKENS``, which ``login()`` would otherwise pick up as a fallback
+    tokenstore and load anyway. The caller dumps the new token explicitly.
+    """
+    saved = os.environ.pop("GARMINTOKENS", None)
+    try:
+        return garmin.login()
+    finally:
+        if saved is not None:
+            os.environ["GARMINTOKENS"] = saved
+
+
 def resolve_env_ref(value):
-    """Resolve ${ENV_VAR} references in config values (matching TS behavior)."""
+    """Resolve ${ENV_VAR} references in config values (matching TS behavior).
+
+    `$${...}` is the escape for a literal `${...}`, as in resolveEnvReferences.
+    """
     if not isinstance(value, str):
         return value
 
     def replacer(match):
-        var_name = match.group(1)
+        if match.group(1):
+            return match.group(0)[1:]
+        var_name = match.group(2)
         env_val = os.environ.get(var_name)
         if env_val is None:
             print(
@@ -63,7 +138,26 @@ def resolve_env_ref(value):
             return match.group(0)
         return env_val
 
-    return re.sub(r"\$\{([^}]+)\}", replacer, value)
+    return re.sub(r"\$(\$?)\{([^}]+)\}", replacer, value)
+
+
+def restrict_token_dir(token_dir):
+    """Make the token directory and the files in it owner-only.
+
+    The token grants full access to the Garmin account. makedirs() honours the
+    umask, which usually leaves the directory 0755, and the library writes the
+    token file with whatever mode it likes. The directory is what keeps other
+    local accounts out even if a later token refresh recreates the file, so it
+    is the one that matters most. Best effort: Windows and some mounts ignore it.
+    """
+    try:
+        os.chmod(token_dir, 0o700)
+        for name in os.listdir(token_dir):
+            path = os.path.join(token_dir, name)
+            if os.path.isfile(path):
+                os.chmod(path, 0o600)
+    except OSError as e:
+        print(f"[Setup] Warning: could not restrict permissions on {token_dir}: {e}")
 
 
 def authenticate(email, password, token_dir):
@@ -71,15 +165,15 @@ def authenticate(email, password, token_dir):
     print(f"[Setup] Authenticating as {email}...")
 
     try:
-        os.makedirs(token_dir, exist_ok=True)
+        os.makedirs(token_dir, mode=0o700, exist_ok=True)
         cleanup_legacy_tokens(token_dir)
 
         garmin = Garmin(email, password, return_on_mfa=True)
 
         print("[Setup] Logging in...")
-        # In 0.3.x, login(tokenstore) auto-dumps tokens on successful
-        # credential login (swallows dump errors silently via contextlib).
-        result = garmin.login(token_dir)
+        # Deliberately not login(token_dir): that would reuse a cached token
+        # and skip authentication. See login_fresh().
+        result = login_fresh(garmin)
 
         # Handle 2FA/MFA challenge
         if isinstance(result, tuple) and result[0] == "needs_mfa":
@@ -87,18 +181,18 @@ def authenticate(email, password, token_dir):
             mfa_code = input("[Setup] Enter the MFA code from your authenticator app: ").strip()
             garmin.resume_login(result[1], mfa_code)
             print("[Setup] MFA verification successful.")
-            # resume_login() does NOT auto-save; dump explicitly.
-            garmin.client.dump(token_dir)
-        else:
-            # Belt-and-suspenders: login()'s auto-dump suppresses exceptions,
-            # so re-dump to surface any write errors here.
-            garmin.client.dump(token_dir)
+
+        # login_fresh() passes no tokenstore, so nothing is auto-dumped on
+        # either path; both branches rely on this explicit dump, which also
+        # surfaces write errors that login()'s auto-dump would have swallowed.
+        garmin.client.dump(token_dir)
+        restrict_token_dir(token_dir)
 
         print(f"[Setup] Tokens saved to: {token_dir}")
         return True
 
     except Exception as e:
-        print(f"\n[Setup] Authentication failed: {e}")
+        print(f"\n[Setup] Authentication failed: {format_error_chain(e)}")
         print(
             "\nIf Garmin is blocking your IP, try running this setup script "
             "from a different machine or network, then copy the token "
@@ -126,42 +220,62 @@ def load_config(config_path):
         print(f"Error: Config file not found: {config_path}", file=sys.stderr)
         sys.exit(1)
     except yaml.YAMLError as e:
-        print(f"Error parsing config: {e}", file=sys.stderr)
+        detail = describe_yaml_error(e, config_path)
+        print(f"Error parsing config: {detail}", file=sys.stderr)
         sys.exit(1)
 
 
+def describe_yaml_error(err, config_path):
+    """Where a YAML error is, never what is written there.
+
+    PyYAML names the offending token in some messages: an unquoted password
+    that starts with '*' comes back as "found undefined alias '<rest>'", one
+    that starts with '!' as "could not determine a constructor for the tag
+    '!<rest>'". The app's own loader (src/config/yaml-parse.ts) reports only
+    the position for the same reason: this output gets pasted into issues.
+    """
+    hint = "If that value is a password or token, put it in quotes."
+    mark = getattr(err, "problem_mark", None)
+    if mark is None:
+        return f"invalid YAML in {config_path}. {hint}"
+    return (
+        f"invalid YAML in {config_path} at line {mark.line + 1}, column "
+        f"{mark.column + 1}. The line is not printed because it may hold a "
+        f"secret. {hint}"
+    )
+
+
+def _garmin_entry(name, entry):
+    return {
+        "name": name,
+        "email": resolve_env_ref(entry.get("email", "")),
+        "password": resolve_env_ref(entry.get("password", "")),
+        "token_dir": entry.get("token_dir", ""),
+    }
+
+
 def get_garmin_users(config):
-    """Extract Garmin users from config. Returns list of (name, email, password, token_dir)."""
-    users = config.get("users", [])
-    global_exporters = config.get("global_exporters", [])
+    """Extract Garmin users from config. Returns list of (name, email, password, token_dir).
+
+    Follows the runtime rule (resolveExportersForUser in src/config/resolve.ts):
+    a user's own Garmin entries are used, and a user without one inherits the
+    first global Garmin entry. This used to be decided once for the whole
+    config, so as soon as anyone had their own entry, every user relying on
+    the global one was skipped (F-20).
+    """
+    users = config.get("users") or []
+    global_garmin = [
+        e for e in (config.get("global_exporters") or []) if e.get("type") == "garmin"
+    ]
     results = []
 
-    # Per-user garmin entries
     for user in users:
-        for entry in user.get("exporters", []):
-            if entry.get("type") == "garmin":
-                results.append(
-                    {
-                        "name": user.get("name", "Unknown"),
-                        "email": resolve_env_ref(entry.get("email", "")),
-                        "password": resolve_env_ref(entry.get("password", "")),
-                        "token_dir": entry.get("token_dir", ""),
-                    }
-                )
-
-    # Global garmin entries apply to all users (only if no per-user entries found)
-    if not results:
-        for entry in global_exporters:
-            if entry.get("type") == "garmin":
-                for user in users:
-                    results.append(
-                        {
-                            "name": user.get("name", "Unknown"),
-                            "email": resolve_env_ref(entry.get("email", "")),
-                            "password": resolve_env_ref(entry.get("password", "")),
-                            "token_dir": entry.get("token_dir", ""),
-                        }
-                    )
+        name = user.get("name", "Unknown")
+        own = [e for e in (user.get("exporters") or []) if e.get("type") == "garmin"]
+        if own:
+            results.extend(_garmin_entry(name, e) for e in own)
+        elif global_garmin:
+            results.append(_garmin_entry(name, global_garmin[0]))
 
     return results
 
@@ -185,7 +299,28 @@ def run_from_config(config_path, target_user=None, cli_token_dir=None):
             sys.exit(1)
 
     has_error = False
+    # One login per Garmin account and token directory. A global entry is
+    # inherited by every user, and logging in once per user meant as many
+    # logins and MFA prompts for the same account (F-20).
+    done = {}
     for user in garmin_users:
+        # A --token-dir on the command line is relative to where it was typed;
+        # one from config.yaml is relative to config.yaml.
+        configured = (user.get("token_dir") or "").strip()
+        token_dir = get_token_dir(
+            cli_token_dir
+            or (resolve_config_token_dir(configured, config_path) if configured else None),
+            base_dir=config_dir(config_path),
+        )
+        key = ((user.get("email") or "").strip().lower(), token_dir)
+        if key[0] and key in done:
+            print(
+                f"\n[Setup] {user['name']} uses the same Garmin account and token "
+                f"directory as {done[key]}, which is handled above."
+            )
+            continue
+        done[key] = user["name"]
+
         print(f"\n[Setup] ===========================================")
         print(f"[Setup] Setting up Garmin for user: {user['name']}")
         print(f"[Setup] ===========================================")
@@ -201,18 +336,19 @@ def run_from_config(config_path, target_user=None, cli_token_dir=None):
             has_error = True
             continue
 
-        token_dir = get_token_dir(cli_token_dir or user.get("token_dir") or None)
-
         if not authenticate(email, password, token_dir):
             has_error = True
 
     if has_error:
         sys.exit(1)
 
-    print("\n[Setup] All done! You can now run 'npm start' to sync your scale.")
+    print(
+        "\n[Setup] All done! You can now run 'ble-scale-sync' "
+        "(or 'npm start' from a checkout) to sync your scale."
+    )
 
 
-def run_legacy(cli_token_dir=None):
+def run_legacy(cli_token_dir=None, base_dir=None):
     """Original env-var-based authentication (backward compatible)."""
     email = os.environ.get("GARMIN_EMAIL", "").strip()
     password = os.environ.get("GARMIN_PASSWORD", "").strip()
@@ -223,12 +359,18 @@ def run_legacy(cli_token_dir=None):
         )
         sys.exit(1)
 
-    token_dir = get_token_dir(cli_token_dir)
+    # base_dir is the directory of --config-path when given (the wizard passes
+    # the config it is writing), so a relative TOKEN_DIR lands where the app
+    # looks for it.
+    token_dir = get_token_dir(cli_token_dir, base_dir=base_dir or config_dir())
 
     if not authenticate(email, password, token_dir):
         sys.exit(1)
 
-    print("[Setup] You can now run 'npm start' to sync your scale.")
+    print(
+        "[Setup] You can now run 'ble-scale-sync' "
+        "(or 'npm start' from a checkout) to sync your scale."
+    )
 
 
 def parse_args():
@@ -242,8 +384,10 @@ def parse_args():
     )
     parser.add_argument(
         "--config-path",
-        default="config.yaml",
-        help="Path to config.yaml (default: config.yaml)",
+        help=(
+            "Path to config.yaml (default: config.yaml in the working directory, "
+            "else in the package directory, as the app picks it)"
+        ),
     )
     parser.add_argument(
         "--user",
@@ -259,10 +403,15 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Loaded here rather than at import, from the directory the config is in.
+    # Variables already in the environment win, as they do in the app.
+    base = config_dir(args.config_path)
+    load_dotenv(base / ".env")
+
     if args.from_config:
-        run_from_config(args.config_path, args.user, args.token_dir)
+        run_from_config(args.config_path or str(base / "config.yaml"), args.user, args.token_dir)
     else:
-        run_legacy(args.token_dir)
+        run_legacy(args.token_dir, base)
 
 
 if __name__ == "__main__":

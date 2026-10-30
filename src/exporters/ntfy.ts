@@ -4,8 +4,7 @@ import type { Exporter, ExportContext, ExportResult } from '../interfaces/export
 import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { NtfyConfig } from './config.js';
 import { formatNotification } from './notification-message.js';
-import { withRetry, httpError } from '../utils/retry.js';
-import { errMsg } from '../utils/error.js';
+import { sendWithRetry, probe } from './http.js';
 
 const log = createLogger('Ntfy');
 
@@ -19,7 +18,9 @@ export const ntfySchema: ExporterSchema = {
       label: 'Topic',
       type: 'string',
       required: true,
-      description: 'Ntfy topic name',
+      description:
+        'Ntfy topic name. On ntfy.sh anyone who knows the topic can read it, so use a long ' +
+        'random name',
     },
     {
       key: 'url',
@@ -58,6 +59,23 @@ export const ntfySchema: ExporterSchema = {
   supportsPerUser: false,
 };
 
+/**
+ * Make a header value safe to hand to fetch.
+ *
+ * Node's fetch (undici) rejects any header value that is not a ByteString, so
+ * a title like "Vážení" or one with an emoji threw a TypeError before the
+ * request left, on every attempt. Latin-1 text passes that check but is sent
+ * as raw ISO-8859-1 bytes, which ntfy reads as broken UTF-8. ntfy documents
+ * RFC 2047 encoded words as the way to send a UTF-8 header
+ * (https://docs.ntfy.sh/publish/, "Message title"), so anything outside
+ * printable ASCII goes out as one base64 encoded word. Plain ASCII is left
+ * alone so existing titles reach older servers exactly as before.
+ */
+function encodeHeaderValue(value: string): string {
+  if (/^[\x20-\x7e]*$/.test(value)) return value;
+  return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+}
+
 export class NtfyExporter implements Exporter {
   readonly name = 'ntfy';
   readonly reportsExports: boolean;
@@ -69,18 +87,8 @@ export class NtfyExporter implements Exporter {
   }
 
   async healthcheck(): Promise<ExportResult> {
-    try {
-      const healthUrl = `${this.config.url.replace(/\/+$/, '')}/v1/health`;
-      const response = await fetch(healthUrl, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) {
-        return { success: false, error: `HTTP ${response.status}` };
-      }
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    const healthUrl = `${this.config.url.replace(/\/+$/, '')}/v1/health`;
+    return probe(healthUrl);
   }
 
   async export(data: BodyComposition, context?: ExportContext): Promise<ExportResult> {
@@ -88,7 +96,7 @@ export class NtfyExporter implements Exporter {
     const targetUrl = `${url.replace(/\/+$/, '')}/${topic}`;
 
     const headers: Record<string, string> = {
-      Title: title,
+      Title: encodeHeaderValue(title),
       Priority: String(priority),
       Tags: 'scales',
     };
@@ -101,23 +109,14 @@ export class NtfyExporter implements Exporter {
 
     const body = formatNotification(data, context);
 
-    return withRetry(
-      async () => {
-        const response = await fetch(targetUrl, {
-          method: 'POST',
-          headers,
-          body,
-          signal: AbortSignal.timeout(10_000),
-        });
-
-        if (!response.ok) {
-          throw httpError(response.status);
-        }
-
-        log.info('Ntfy notification sent.');
-        return { success: true };
+    return sendWithRetry(
+      targetUrl,
+      { method: 'POST', headers, body },
+      {
+        log,
+        label: 'ntfy notification',
+        onOk: () => log.info('Ntfy notification sent.'),
       },
-      { log, label: 'ntfy notification' },
     );
   }
 }

@@ -47,6 +47,19 @@ const OP_RESPONSE_ADE = 0x20;
 const EPOCH_2010 = 1262304000;
 
 /**
+ * Earliest measurement time a Trisa stamp is believed for: 2020-09-13, the
+ * bound Salter uses for the same question. The stamp counts seconds from
+ * 2010-01-01, which is also where the clock of a scale nobody has synced
+ * starts, so a stamp below this is an unset clock rather than a weigh-in from
+ * years ago. Passed on, it would make every live weigh-in look like history
+ * (ADR D027), so it is dropped and the reading counts as measured on receipt.
+ */
+const MIN_TRUSTED_UNIX_SEC = 1_600_000_000;
+
+/** Width of the optional measurement-time field (u32 LE seconds since 2010). */
+const TIMESTAMP_LEN = 4;
+
+/**
  * Retry budget for a challenge-response write. BlueZ answers a badly timed
  * write with a transient `org.bluez.Error.InProgress`, and the scale is waiting
  * on that single ack (#138).
@@ -55,6 +68,18 @@ const CHALLENGE_WRITE_RETRIES = 2;
 const CHALLENGE_RETRY_MS = 250;
 
 type Variant = 'trisa' | 'ade';
+
+/**
+ * One weigh-in's negotiated state, replaced whole in onSessionStart (#394,
+ * SCALES.md). onSessionEnd is best effort (a timeout abandons the read rather
+ * than cancelling it), so it cannot be what clears this.
+ */
+class TrisaSession {
+  /** Stored password from opcode 0xA0 (Trisa). ADE does not send this. */
+  password: Buffer | null = null;
+  /** Challenge frame that arrived before the connection was ready (#138). */
+  pendingChallenge: Buffer | null = null;
+}
 
 /**
  * Adapter for the Trisa body-composition scale family.
@@ -77,8 +102,6 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   readonly charNotifyUuid = CHR_MEASUREMENT_TRISA;
   readonly charWriteUuid = CHR_DOWNLOAD;
 
-  readonly normalizesWeight = true;
-
   readonly characteristics: CharacteristicBinding[] = [
     // Trisa-only measurement char.
     { uuid: CHR_MEASUREMENT_TRISA, type: 'notify', optional: true },
@@ -94,12 +117,9 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
   /** Detected firmware variant. Set in onConnected(). */
   private variant: Variant = 'trisa';
-  /** Stored password from opcode 0xA0 (Trisa). ADE does not send this. */
-  private password: Buffer | null = null;
   /** Reference to write function, saved from onConnected context. */
   private writeFn: ConnectionContext['write'] | null = null;
-  /** Challenge frame that arrived before the connection was ready (#138). */
-  private pendingChallenge: Buffer | null = null;
+  private s = new TrisaSession();
   /**
    * True once onConnected() has run for the current session.
    *
@@ -116,8 +136,9 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   async onConnected(ctx: ConnectionContext): Promise<void> {
     // NOTE: pendingChallenge is deliberately NOT cleared here. The frame it
     // holds arrived moments ago, before this method ran, and replaying it is the
-    // whole point (#138). Stale state from an earlier session is cleared in
-    // onSessionEnd() instead, which is where a session actually ends.
+    // whole point (#138). The PREVIOUS session's leftovers are cleared in
+    // onSessionStart(), which runs before anything is subscribed and so cannot
+    // discard a frame belonging to this session.
     this.writeFn = ctx.write;
     this.connected = true;
 
@@ -153,29 +174,29 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
     // Replay a challenge that beat this method to the notification handler, now
     // that both the write function and the variant are known (#138).
-    const queued: Buffer | null = this.pendingChallenge;
+    const queued: Buffer | null = this.s.pendingChallenge;
     if (queued) {
-      this.pendingChallenge = null;
+      this.s.pendingChallenge = null;
       bleLog.debug(`Replaying queued challenge: ${queued.toString('hex')}`);
       this.handleUploadChannel(queued);
     }
   }
 
+  onSessionStart(): void {
+    this.s = new TrisaSession();
+  }
+
   /**
-   * End of a GATT session: forget everything tied to it.
-   *
-   * `writeFn` is a closure over the connection that just went away, so anything
-   * written through it after this point is discarded by the transport (on the
-   * mqtt-proxy it is published into the void and even resolves successfully).
-   * Clearing `connected` is also what re-arms the pre-connect challenge queue
-   * for the next cycle; without it the #138 fix would work exactly once per
-   * process, which in continuous mode means once ever.
+   * Release the connection references. These two are not session state to be
+   * re-derived but a live handle to a link that is gone, and writing through a
+   * stale one throws (#138), so they are dropped as soon as the session ends
+   * rather than waiting for the next one to start. Clearing `connected` is also
+   * what re-arms the pre-connect challenge queue for the next cycle; without it
+   * the #138 fix would work exactly once per process.
    */
   onSessionEnd(): void {
     this.connected = false;
     this.writeFn = null;
-    this.pendingChallenge = null;
-    this.password = null;
   }
 
   /**
@@ -266,7 +287,7 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     // ack that never came, once per cycle, forever (#138). Hold the raw frame
     // and replay it from onConnected(), where both are known.
     if (opcode === OP_CHALLENGE && !this.connected) {
-      this.pendingChallenge = Buffer.from(data);
+      this.s.pendingChallenge = Buffer.from(data);
       bleLog.debug('Challenge arrived before connect completed; queued for replay');
       return;
     }
@@ -287,13 +308,13 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     }
 
     if (opcode === OP_PASSWORD) {
-      this.password = Buffer.from(data.subarray(1));
-    } else if (opcode === OP_CHALLENGE && this.password) {
+      this.s.password = Buffer.from(data.subarray(1));
+    } else if (opcode === OP_CHALLENGE && this.s.password) {
       const challenge = data.subarray(1);
       const response = Buffer.alloc(challenge.length + 1);
       response[0] = OP_RESPONSE_TRISA;
       for (let i = 0; i < challenge.length; i++) {
-        response[i + 1] = challenge[i] ^ (this.password[i % this.password.length] ?? 0);
+        response[i + 1] = challenge[i] ^ (this.s.password[i % this.s.password.length] ?? 0);
       }
       this.sendResponse(response, undefined, Buffer.from(data));
     }
@@ -331,7 +352,8 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
           // Out of retries: the link is most likely already gone. Keep the frame
           // only while no newer one is waiting, so a late failure cannot clobber
           // a fresher challenge.
-          if (replayOnFailure && !this.pendingChallenge) this.pendingChallenge = replayOnFailure;
+          if (replayOnFailure && !this.s.pendingChallenge)
+            this.s.pendingChallenge = replayOnFailure;
         },
       );
     };
@@ -341,24 +363,31 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
   /**
    * Parse a Trisa measurement frame.
    *
-   * Layout (verified for Trisa 0x8A21 and ADE BA 1600 0x8A24, weight only):
+   * Layout (openScale TrisaBodyAnalyzeHandler; weight and timestamp confirmed
+   * by the ADE BA 1600 capture in #138):
    *   [0]      info flags
-   *             bit 0: timestamp present (7 bytes at offset 5)
+   *             bit 0: timestamp present (4 bytes at offset 5)
    *             bit 1: resistance1 present (4 bytes base-10 float)
    *             bit 2: resistance2 present (4 bytes base-10 float)
    *   [1-3]    weight mantissa, unsigned 24-bit little-endian
    *   [4]      weight exponent, signed int8
-   *   [5+]     optional timestamp (7 bytes if bit0 set)
+   *   [5-8]    optional timestamp, u32 LE seconds since 2010-01-01 UTC (bit0)
    *   then:    optional resistance1 (4 bytes if bit1 set)
    *   then:    optional resistance2 (4 bytes if bit2 set)
    *
    * Weight = mantissa * 10^exponent.
    * Impedance from resistance2: r2 < 410 ? 3.0 : 0.3 * (r2 - 400).
    *
-   * NOTE: only the Trisa branch walks the optional-field table. For ADE the
-   * post-weight layout is unverified (timestamp may be 8 bytes instead of 7)
-   * and body comp arrives on a separate 0x8A22 push, so the parser
-   * short-circuits to weight-only after computing the weight.
+   * The timestamp is the time the scale measured the frame and goes into
+   * `ScaleReading.timestamp` (ADR D027, review D-06): a stored record the scale
+   * sends after connecting is then history rather than today's weigh-in. The
+   * capture's stamp `65 2a b2 1e` decodes to 2026-04-27 13:32:21 UTC, four days
+   * before it was committed, which is what pins the width at 4 bytes; this
+   * parser used to skip 7.
+   *
+   * NOTE: only the Trisa branch walks the resistance fields. For ADE their
+   * meaning is unverified and body comp arrives on a separate 0x8A22 push, so
+   * the parser returns the weight and the timestamp only.
    */
   private parseMeasurement(data: Buffer): ScaleReading | null {
     if (data.length < 5) return null;
@@ -368,12 +397,6 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
     const hasResistance1 = (flags & 0x02) !== 0;
     const hasResistance2 = (flags & 0x04) !== 0;
 
-    // Skip frames that are just timestamps (only bit0 set, no weight data expected)
-    if (hasTimestamp && !hasResistance1 && !hasResistance2) {
-      const mantissa = data[1] | (data[2] << 8) | (data[3] << 16);
-      if (mantissa === 0) return null;
-    }
-
     // Weight: 24-bit unsigned LE mantissa + signed exponent
     const mantissa = data[1] | (data[2] << 8) | (data[3] << 16);
     const exponent = data.readInt8(4);
@@ -381,31 +404,47 @@ export class TrisaAdapter implements ScaleAdapterCore, GattWiring, MultiCharNoti
 
     if (weight <= 0 || !Number.isFinite(weight)) return null;
 
-    // ADE BA 1600: only the weight bytes are verified (single capture frame in
-    // #138). The post-weight layout (timestamp width, resistance encoding)
-    // is not confirmed and body-comp values arrive on a separate 0x8A22 push
-    // anyway. Don't walk the offset table; return weight only until more
-    // captures are available.
-    if (this.variant === 'ade') return { weight, impedance: 0 };
+    const timestamp = hasTimestamp ? this.readTimestamp(data) : undefined;
+    const reading: ScaleReading = { weight, impedance: 0 };
+    if (timestamp) reading.timestamp = timestamp;
+
+    // ADE BA 1600: the resistance fields after the timestamp are not decoded
+    // for this firmware, and body-comp values arrive on a separate 0x8A22 push
+    // anyway. Weight and time only until more captures are available.
+    if (this.variant === 'ade') return reading;
 
     // Walk through optional fields to find resistance2.
     let offset = 5;
-    if (hasTimestamp) offset += 7;
+    if (hasTimestamp) offset += TIMESTAMP_LEN;
     if (hasResistance1) offset += 4;
 
-    let impedance = 0;
     if (hasResistance2 && offset + 4 <= data.length) {
       const r2Mantissa = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
       const r2Exponent = data.readInt8(offset + 3);
       const r2 = r2Mantissa * Math.pow(10, r2Exponent);
 
       if (r2 < 410) {
-        impedance = 3.0;
+        reading.impedance = 3.0;
       } else {
-        impedance = 0.3 * (r2 - 400);
+        reading.impedance = 0.3 * (r2 - 400);
       }
     }
 
-    return { weight, impedance };
+    return reading;
+  }
+
+  /**
+   * The measurement time at [5..8], or undefined when it cannot be trusted:
+   * the field is cut short, or the scale's clock was never set (see
+   * MIN_TRUSTED_UNIX_SEC).
+   */
+  private readTimestamp(data: Buffer): Date | undefined {
+    if (data.length < 5 + TIMESTAMP_LEN) return undefined;
+    const unixSec = EPOCH_2010 + data.readUInt32LE(5);
+    if (unixSec < MIN_TRUSTED_UNIX_SEC) {
+      bleLog.debug(`Trisa: ignoring the stamp of an unset scale clock (${unixSec})`);
+      return undefined;
+    }
+    return new Date(unixSec * 1000);
   }
 }

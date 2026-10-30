@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   r2,
   uuid16,
@@ -7,8 +7,21 @@ import {
   computePhysiqueRating,
   computeBiaFat,
   buildPayload,
+  biaFatIfPlausible,
+  compositionRejection,
+  isPlausibleImpedance,
+  isPlausibleBmr,
+  isPlausibleMetabolicAge,
+  isPlausibleSkeletalMusclePercent,
+  biaPayload,
+  noEstimateNote,
+  IMPEDANCE_MIN_OHM,
+  IMPEDANCE_MAX_OHM,
 } from '../src/scales/body-comp-helpers.js';
 import type { UserProfile } from '../src/interfaces/scale-adapter.js';
+import type { SegmentImpedance } from '../src/scales/body-comp-helpers.js';
+import { defaultProfile } from './helpers/scale-test-utils.js';
+import { LogLevel, setLogLevel } from '../src/logger.js';
 
 describe('r2()', () => {
   it('rounds 1.005 to 1 (IEEE 754 — 1.005*100 = 100.49999…)', () => {
@@ -316,5 +329,501 @@ describe('buildPayload()', () => {
     const idealBmr = 10 * 80 + 6.25 * 183 - 5 * 25 + 5;
     const metabolicAge = 30 + Math.trunc((idealBmr - bmr) / 15);
     expect(p.metabolicAge).toBe(metabolicAge);
+  });
+
+  // #433: the age-25 reference used the male constant for everyone, so an
+  // otherwise identical woman came out 11 years older. With matching constants
+  // weight and height cancel (metabolic age is age + trunc((age - 25) / 3) for
+  // a non-athlete), so the body values here are incidental; the sex is the point.
+  it('gives the same metabolic age to both sexes for an identical body', () => {
+    const female = { ...profile, gender: 'female' as const, age: 26, height: 172 };
+    const male = { ...female, gender: 'male' as const };
+    const f = buildPayload(61.5, 500, {}, female);
+    const m = buildPayload(61.5, 500, {}, male);
+    expect(f.metabolicAge).toBe(26);
+    expect(f.metabolicAge).toBe(m.metabolicAge);
+  });
+});
+
+// #386: computeBiaFat bounds its output but not its input, and both directions
+// produce a confident wrong answer. This is the gate the adapters go through.
+describe('biaFatIfPlausible', () => {
+  const p = defaultProfile();
+
+  it('returns the BIA figure unchanged inside the band', () => {
+    // Concrete numbers rather than `=== computeBiaFat(...)`, which would only
+    // restate the function body. 80 kg, 183 cm, 30, male, non-athlete.
+    expect(biaFatIfPlausible(80, 500, p)).toBeCloseTo(25.06, 2);
+    expect(biaFatIfPlausible(80, 900, p)).toBeCloseTo(43.78, 2);
+    expect(biaFatIfPlausible(80, IMPEDANCE_MAX_OHM, p)).toBeCloseTo(49.63, 2);
+  });
+
+  it('bottoms out well inside the band, and not monotonically', () => {
+    // Worth pinning, because it bounds what the guard can do for you. For this
+    // body the lean-mass cap inside computeBiaFat engages below about 313 ohm
+    // and pins the result at exactly 4 %. Just above it the cap lets go, the
+    // raw formula returns about 1.4 %, and the 3 % clamp catches that instead.
+    // So the output is not monotonic in impedance down here, and everything
+    // from roughly 320 ohm down is a clamp rather than a measurement.
+    expect(biaFatIfPlausible(80, IMPEDANCE_MIN_OHM, p)).toBeCloseTo(4, 2);
+    expect(biaFatIfPlausible(80, 300, p)).toBeCloseTo(4, 2);
+    expect(biaFatIfPlausible(80, 320, p)).toBeCloseTo(3, 2);
+    // The band stops a value wrong by a factor of ten. It cannot rescue one
+    // that is wrong by a little: 320 ohm is inside the band and still useless.
+    expect(biaFatIfPlausible(80, 400, p)).toBeCloseTo(14.53, 2);
+  });
+
+  it('refuses anything outside the band', () => {
+    for (const z of [IMPEDANCE_MIN_OHM - 1, IMPEDANCE_MAX_OHM + 1, 30, 50, 2000, 65535]) {
+      expect(biaFatIfPlausible(80, z, p)).toBeUndefined();
+    }
+  });
+
+  it('refuses a missing measurement, which is the normal case, not an error', () => {
+    expect(biaFatIfPlausible(80, 0, p)).toBeUndefined();
+    expect(biaFatIfPlausible(80, -1, p)).toBeUndefined();
+    expect(biaFatIfPlausible(80, Number.NaN, p)).toBeUndefined();
+  });
+
+  it('feeds buildPayload the Deurenberg fallback when it refuses', () => {
+    // The whole point of returning undefined rather than 0: the reading lands
+    // on exactly the figure these adapters published before.
+    const refused = buildPayload(80, 50, { fat: biaFatIfPlausible(80, 50, p) }, p);
+    const bmiOnly = buildPayload(80, 50, {}, p);
+    expect(refused.bodyFatPercent).toBe(bmiOnly.bodyFatPercent);
+  });
+
+  it('catches the failure that actually happens: too LOW, not too high', () => {
+    // A tenfold-small impedance drives height^2 / Z up until lean mass exceeds
+    // body weight, and computeBiaFat's own cap then pins the 4 % floor. That is
+    // a plausible-looking 4 % body fat, not an obvious error.
+    expect(computeBiaFat(80, 50, p)).toBeCloseTo(4, 1);
+    expect(biaFatIfPlausible(80, 50, p)).toBeUndefined();
+  });
+});
+
+// D028 / E-15: a scale-reported composition is used only as a whole. Only fat
+// used to be checked, so `water: 0` exported 0 % water next to a real fat value.
+describe('buildPayload: scale composition is validated as a whole (D028, E-15)', () => {
+  const p: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+
+  it.each([
+    ['water 0', { fat: 22, water: 0, muscle: 42, bone: 3.2 }],
+    ['water sentinel', { fat: 22, water: 6553.5 }],
+    ['bone 0', { fat: 22, bone: 0 }],
+    ['muscle above 100 %', { fat: 22, muscle: 150 }],
+    ['water without fat', { water: 55 }],
+  ])('discards the whole set on %s', (_label, comp) => {
+    const p0 = buildPayload(80, 0, comp, p);
+    const estimate = buildPayload(80, 0, {}, p);
+    expect(p0.bodyFatPercent).toBe(estimate.bodyFatPercent);
+    expect(p0.waterPercent).toBe(estimate.waterPercent);
+    expect(p0.boneMass).toBe(estimate.boneMass);
+    expect(p0.muscleMass).toBe(estimate.muscleMass);
+  });
+
+  it('falls back to BIA, not the BMI estimate, when the impedance is usable', () => {
+    const rejected = buildPayload(80, 500, { fat: 22, water: 0 }, p);
+    expect(rejected.bodyFatPercent).toBeCloseTo(biaFatIfPlausible(80, 500, p)!, 2);
+  });
+
+  it('accepts a complete, plausible set unchanged', () => {
+    expect(compositionRejection({ fat: 22, water: 55, muscle: 42, bone: 3.2 })).toBeNull();
+    expect(compositionRejection({})).toBeNull();
+  });
+});
+
+// D078: an adapter may pass the scale's own BMR and body age. Each replaces its
+// formula on its own, only inside its band and only with an accepted
+// composition. 80 kg, 183 cm, 30, male: the formulas give BMR 1798 (Mifflin-St
+// Jeor 1798.75) and metabolic age 31; athlete 1888 and 26.
+describe("buildPayload: the scale's own BMR and metabolic age (D078)", () => {
+  const p: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+  const athlete: UserProfile = { ...p, isAthlete: true };
+
+  it('calculates both when the scale sent neither', () => {
+    expect(buildPayload(80, 0, { fat: 22 }, p)).toMatchObject({ bmr: 1798, metabolicAge: 31 });
+    expect(buildPayload(80, 0, { fat: 22 }, athlete)).toMatchObject({
+      bmr: 1888,
+      metabolicAge: 26,
+    });
+  });
+
+  it("exports the scale's BMR and body age and leaves everything else as it was", () => {
+    const own = buildPayload(80, 0, { fat: 22, bmr: 1650, metabolicAge: 35 }, p);
+    expect(own).toEqual({ ...buildPayload(80, 0, { fat: 22 }, p), bmr: 1650, metabolicAge: 35 });
+  });
+
+  // The trap: the formula metabolic age compares the formula BMR with the
+  // formula BMR at 25. Fed the scale's 1500 it would read 30 + trunc(323.75 /
+  // 15) = 51.
+  it("keeps the formula metabolic age, from the formula BMR, with only the scale's BMR", () => {
+    expect(buildPayload(80, 0, { fat: 22, bmr: 1500 }, p)).toMatchObject({
+      bmr: 1500,
+      metabolicAge: 31,
+    });
+  });
+
+  it("keeps the formula BMR with only the scale's body age", () => {
+    expect(buildPayload(80, 0, { fat: 22, metabolicAge: 35 }, p)).toMatchObject({
+      bmr: 1798,
+      metabolicAge: 35,
+    });
+  });
+
+  // Without a body fat value there is no measurement they could come from.
+  it('ignores them from a scale that sends no body fat', () => {
+    expect(buildPayload(80, 0, { bmr: 1650, metabolicAge: 35 }, p)).toMatchObject({
+      bmr: 1798,
+      metabolicAge: 31,
+    });
+  });
+
+  // Both describe the body the rejected set measured, so they go with it.
+  it('drops both with a rejected composition', () => {
+    const rejected = buildPayload(80, 0, { fat: 22, water: 0, bmr: 1650, metabolicAge: 35 }, p);
+    expect(rejected).toEqual(buildPayload(80, 0, {}, p));
+    expect(rejected).toMatchObject({ bmr: 1798, metabolicAge: 31 });
+  });
+
+  // 1650 would be 1732 with the athlete factor; 35 is above the age of 30, so
+  // the athlete cap would make it 25.
+  it('applies no athlete adjustment to them', () => {
+    expect(buildPayload(80, 0, { fat: 22, bmr: 1650, metabolicAge: 35 }, athlete)).toMatchObject({
+      bmr: 1650,
+      metabolicAge: 35,
+    });
+  });
+
+  it('exports them as whole numbers', () => {
+    expect(buildPayload(80, 0, { fat: 22, bmr: 1650.9, metabolicAge: 35.7 }, p)).toMatchObject({
+      bmr: 1650,
+      metabolicAge: 35,
+    });
+  });
+
+  it.each([
+    [499, false],
+    [500, true],
+    [5000, true],
+    [5001, false],
+    [0, false],
+    [65535, false],
+    [Number.NaN, false],
+    [Number.POSITIVE_INFINITY, false],
+  ])('BMR %d kcal: from the scale %s', (kcal, used) => {
+    expect(isPlausibleBmr(kcal)).toBe(used);
+    expect(buildPayload(80, 0, { fat: 22, bmr: kcal }, p).bmr).toBe(used ? kcal : 1798);
+  });
+
+  it.each([
+    [0, false],
+    [11, false],
+    [12, true],
+    [120, true],
+    [121, false],
+    [255, false],
+    [Number.NaN, false],
+  ])('body age %d: from the scale %s', (years, used) => {
+    expect(isPlausibleMetabolicAge(years)).toBe(used);
+    expect(buildPayload(80, 0, { fat: 22, metabolicAge: years }, p).metabolicAge).toBe(
+      used ? years : 31,
+    );
+  });
+});
+
+// E-06 / D002: the rating's thresholds are calibrated on the skeletal estimate.
+// A vendor muscle percentage (fat-free mass minus bone, about 0.55 to 0.70 of
+// body weight) used to be fed in instead and pinned the rating.
+describe('buildPayload: physique rating ignores a scale muscle value (E-06)', () => {
+  const p: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+
+  it('rates the same body the same with or without a vendor muscle %', () => {
+    // fat 17 %: skeletal estimate 0.54 * 66.4 = 35.9 kg < 0.45 * 80 -> 8.
+    // 72 % muscle (57.6 kg) would have read as 9.
+    const withMuscle = buildPayload(80, 0, { fat: 17, muscle: 72 }, p);
+    const without = buildPayload(80, 0, { fat: 17 }, p);
+    expect(withMuscle.physiqueRating).toBe(8);
+    expect(withMuscle.physiqueRating).toBe(without.physiqueRating);
+    // The exported muscle mass still comes from the scale.
+    expect(withMuscle.muscleMass).toBe(r2(0.72 * 80));
+  });
+});
+
+// #497: a scale's own skeletal muscle percentage, by the D078 rule, but with
+// no formula behind it: the key is there only when the scale measured it.
+describe("buildPayload: the scale's own skeletal muscle percentage (#497)", () => {
+  const p: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+
+  it('exports it next to an accepted body fat and leaves everything else as it was', () => {
+    const own = buildPayload(80, 0, { fat: 22, skeletalMuscle: 43.9 }, p);
+    expect(own).toEqual({ ...buildPayload(80, 0, { fat: 22 }, p), skeletalMusclePercent: 43.9 });
+  });
+
+  it('rounds it to 0.01', () => {
+    expect(buildPayload(80, 0, { fat: 22, skeletalMuscle: 43.456 }, p).skeletalMusclePercent).toBe(
+      43.46,
+    );
+  });
+
+  // Without a body fat value there is no measurement it could come from.
+  it('leaves it out from a scale that sends no body fat', () => {
+    const payload = buildPayload(80, 0, { skeletalMuscle: 43.9 }, p);
+    expect(payload).not.toHaveProperty('skeletalMusclePercent');
+    expect(payload).toEqual(buildPayload(80, 0, {}, p));
+  });
+
+  // It describes the body the rejected set measured, so it goes with it.
+  it('leaves it out with a rejected composition', () => {
+    const payload = buildPayload(80, 0, { fat: 22, water: 0, skeletalMuscle: 43.9 }, p);
+    expect(payload).not.toHaveProperty('skeletalMusclePercent');
+    expect(payload).toEqual(buildPayload(80, 0, {}, p));
+  });
+
+  // Not even a key with undefined: a JSON consumer would see no difference,
+  // but the payload object is what the session goldens and toEqual compare.
+  it('is never estimated: no key from the BMI estimate, BIA or a scale body fat alone', () => {
+    for (const payload of [
+      buildPayload(80, 0, {}, p),
+      buildPayload(80, 0, { fat: 22, water: 55, bone: 3, muscle: 70 }, p),
+      biaPayload({ weight: 80, impedance: 500 }, p),
+    ]) {
+      expect(Object.keys(payload)).not.toContain('skeletalMusclePercent');
+    }
+  });
+
+  it.each([
+    [9.99, false],
+    [10, true],
+    [90, true],
+    [90.01, false],
+    [0, false],
+    [6553.5, false],
+    [Number.NaN, false],
+    [Number.POSITIVE_INFINITY, false],
+  ])('skeletal muscle %d %%: exported %s', (pct, used) => {
+    expect(isPlausibleSkeletalMusclePercent(pct)).toBe(used);
+    const payload = buildPayload(80, 0, { fat: 22, skeletalMuscle: pct }, p);
+    if (used) expect(payload.skeletalMusclePercent).toBe(pct);
+    else expect(payload).toEqual(buildPayload(80, 0, { fat: 22 }, p));
+  });
+
+  it('says in the debug log why an out-of-band value is not exported', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    setLogLevel(LogLevel.DEBUG);
+    try {
+      buildPayload(80, 0, { fat: 22, skeletalMuscle: 6553.5 }, p);
+      expect(log.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        expect.stringContaining(
+          '[BIA:debug] Scale-reported skeletal muscle 6553.5 % is outside 10-90 %; not exported.',
+        ),
+      );
+    } finally {
+      setLogLevel(LogLevel.INFO);
+      log.mockRestore();
+    }
+  });
+});
+
+// #497: segment impedances are raw measurements, not composition. Values from
+// the #117 R-MSC04 record (trunk / L arm / R arm / L leg / R leg).
+describe('buildPayload: segment impedances (#497)', () => {
+  const p: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+  const SEG: SegmentImpedance = {
+    trunk: { at20kHz: 22.2, at100kHz: 17.4 },
+    leftArm: { at20kHz: 310.4, at100kHz: 275.3 },
+    rightArm: { at20kHz: 305.5, at100kHz: 270.4 },
+    leftLeg: { at20kHz: 227.6, at100kHz: 201.7 },
+    rightLeg: { at20kHz: 234.6, at100kHz: 208.5 },
+  };
+  const KEYS = {
+    impedanceTrunk20kHz: 22.2,
+    impedanceTrunk100kHz: 17.4,
+    impedanceLeftArm20kHz: 310.4,
+    impedanceLeftArm100kHz: 275.3,
+    impedanceRightArm20kHz: 305.5,
+    impedanceRightArm100kHz: 270.4,
+    impedanceLeftLeg20kHz: 227.6,
+    impedanceLeftLeg100kHz: 201.7,
+    impedanceRightLeg20kHz: 234.6,
+    impedanceRightLeg100kHz: 208.5,
+  };
+
+  it('exports the ten values as flat keys and leaves everything else as it was', () => {
+    const payload = buildPayload(80, 0, { fat: 22, segmentImpedance: SEG }, p);
+    expect(payload).toEqual({ ...buildPayload(80, 0, { fat: 22 }, p), ...KEYS });
+  });
+
+  // Measurements of their own: a set without body fat, or one that is
+  // rejected, still has them.
+  it('keeps them without a body fat and with a rejected composition', () => {
+    expect(buildPayload(80, 0, { segmentImpedance: SEG }, p)).toEqual({
+      ...buildPayload(80, 0, {}, p),
+      ...KEYS,
+    });
+    expect(buildPayload(80, 0, { fat: 22, water: 0, segmentImpedance: SEG }, p)).toEqual({
+      ...buildPayload(80, 0, {}, p),
+      ...KEYS,
+    });
+  });
+
+  it.each([
+    ['0', 0],
+    ['the 0xFFFF sentinel', 6553.5],
+    ['above the sentinel', 7000],
+    ['negative', -1],
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+  ])('leaves out one value that is %s and keeps the other nine', (_what, ohm) => {
+    const seg = { ...SEG, leftLeg: { at20kHz: 227.6, at100kHz: ohm } };
+    const payload = buildPayload(80, 0, { fat: 22, segmentImpedance: seg }, p);
+    const { impedanceLeftLeg100kHz: _dropped, ...nine } = KEYS;
+    expect(payload).toEqual({ ...buildPayload(80, 0, { fat: 22 }, p), ...nine });
+    expect(Object.keys(payload)).not.toContain('impedanceLeftLeg100kHz');
+  });
+
+  it('keeps a value just below the sentinel, to 0.01', () => {
+    const seg = { ...SEG, trunk: { at20kHz: 6553.4, at100kHz: 17.456 } };
+    const payload = buildPayload(80, 0, { segmentImpedance: seg }, p);
+    expect(payload.impedanceTrunk20kHz).toBe(6553.4);
+    expect(payload.impedanceTrunk100kHz).toBe(17.46);
+  });
+
+  it('never estimates them', () => {
+    for (const payload of [
+      buildPayload(80, 0, {}, p),
+      buildPayload(80, 500, { fat: 22 }, p),
+      biaPayload({ weight: 80, impedance: 500 }, p),
+    ]) {
+      expect(Object.keys(payload).filter((k) => k.startsWith('impedance'))).toEqual(['impedance']);
+    }
+  });
+});
+
+// #497: users[].estimate_body_composition false. Nothing measured means
+// the six values the estimated body fat would give are withheld (null).
+describe('buildPayload: estimate_body_composition off (#497)', () => {
+  const on: UserProfile = { height: 183, age: 30, gender: 'male', isAthlete: false };
+  const off: UserProfile = { ...on, estimateBodyComposition: false };
+  const WITHHELD = {
+    bodyFatPercent: null,
+    waterPercent: null,
+    boneMass: null,
+    muscleMass: null,
+    visceralFat: null,
+    physiqueRating: null,
+  };
+
+  it('withholds the six composition values and keeps weight, impedance, BMI, BMR and metabolic age', () => {
+    const estimate = buildPayload(80, 0, {}, on);
+    expect(buildPayload(80, 0, {}, off)).toEqual({
+      weight: 80,
+      impedance: 0,
+      bmi: estimate.bmi,
+      ...WITHHELD,
+      bmr: estimate.bmr,
+      metabolicAge: estimate.metabolicAge,
+    });
+  });
+
+  it('changes nothing with the setting on or absent', () => {
+    expect(buildPayload(80, 0, {}, { ...on, estimateBodyComposition: true })).toEqual(
+      buildPayload(80, 0, {}, on),
+    );
+    expect(buildPayload(80, 0, {}, on).bodyFatPercent).toBeGreaterThan(0);
+  });
+
+  // Only the BMI estimate is withheld: a measured body fat, the scale's own or
+  // BIA from a usable impedance, goes out as before.
+  it("keeps the scale's own body fat and a BIA body fat", () => {
+    expect(buildPayload(80, 0, { fat: 22 }, off)).toEqual(buildPayload(80, 0, { fat: 22 }, on));
+    const bia = { weight: 80, impedance: 500 };
+    expect(biaPayload(bia, off)).toEqual(biaPayload(bia, on));
+    expect(biaPayload(bia, off).bodyFatPercent).not.toBeNull();
+  });
+
+  it('falls back to BIA for a rejected composition with a usable impedance, and withholds without one', () => {
+    const rejected = { fat: 22, water: 0 };
+    expect(buildPayload(80, 500, rejected, off)).toEqual(buildPayload(80, 500, rejected, on));
+    expect(buildPayload(80, 0, rejected, off)).toMatchObject(WITHHELD);
+  });
+
+  it('withholds when the impedance is not usable', () => {
+    expect(biaPayload({ weight: 80, impedance: 2000 }, off)).toMatchObject(WITHHELD);
+  });
+
+  // As a whole: a weigh-in never mixes measured and missing composition.
+  it("withholds a scale's visceral fat that came without a body fat", () => {
+    expect(buildPayload(80, 0, { visceralFat: 8 }, off)).toMatchObject(WITHHELD);
+  });
+
+  it('keeps the segment impedances, and has no skeletal muscle', () => {
+    const seg: SegmentImpedance = {
+      trunk: { at20kHz: 22.2, at100kHz: 17.4 },
+      leftArm: { at20kHz: 310.4, at100kHz: 275.3 },
+      rightArm: { at20kHz: 305.5, at100kHz: 270.4 },
+      leftLeg: { at20kHz: 227.6, at100kHz: 201.7 },
+      rightLeg: { at20kHz: 234.6, at100kHz: 208.5 },
+    };
+    const payload = buildPayload(80, 0, { segmentImpedance: seg, skeletalMuscle: 43.9 }, off);
+    expect(payload).toMatchObject({ ...WITHHELD, impedanceTrunk20kHz: 22.2 });
+    expect(payload).not.toHaveProperty('skeletalMusclePercent');
+  });
+
+  it('says so in the debug lines that would otherwise promise an estimate', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    setLogLevel(LogLevel.DEBUG);
+    try {
+      biaPayload({ weight: 80, impedance: 2000 }, off);
+      buildPayload(80, 0, { fat: 22, water: 0 }, off);
+      const lines = log.mock.calls.map((c) => String(c[0]));
+      expect(lines).toContainEqual(
+        expect.stringContaining(
+          'so body composition is not computed from it, and with estimate_body_composition ' +
+            'off none is estimated (#386).',
+        ),
+      );
+      expect(lines).toContainEqual(
+        expect.stringContaining(
+          'Scale-reported composition discarded (water 0 % is outside 0-80 %); using the ' +
+            'impedance if it is usable, and no estimate (estimate_body_composition is off).',
+        ),
+      );
+      expect(lines.some((l) => l.includes('BMI estimate') || l.includes('estimating'))).toBe(false);
+    } finally {
+      setLogLevel(LogLevel.INFO);
+      log.mockRestore();
+    }
+  });
+
+  it('words the adapter note only when the setting is off', () => {
+    expect(noEstimateNote(off)).toBe(
+      'exporting no body composition (estimate_body_composition is off)',
+    );
+    expect(noEstimateNote(on)).toBeNull();
+  });
+});
+
+// E-14: Deurenberg et al. 1991 fit children (15 and younger) separately.
+describe('estimateBodyFat: children (E-14)', () => {
+  it("uses the children's equation at 15 and younger", () => {
+    const girl: UserProfile = { height: 140, age: 10, gender: 'female', isAthlete: false };
+    // 1.51 * 17 - 0.70 * 10 - 3.6 * 0 + 1.4 = 20.07 (adult equation: 17.3)
+    expect(estimateBodyFat(17, girl)).toBeCloseTo(20.07, 2);
+  });
+
+  it('keeps the adult equation from 16 on', () => {
+    const teen: UserProfile = { height: 175, age: 16, gender: 'male', isAthlete: false };
+    expect(estimateBodyFat(20, teen)).toBeCloseTo(1.2 * 20 + 0.23 * 16 - 10.8 - 5.4, 5);
+  });
+});
+
+describe('isPlausibleImpedance (D028)', () => {
+  it('accepts the band and refuses 0, sentinels and non-numbers', () => {
+    expect(isPlausibleImpedance(IMPEDANCE_MIN_OHM)).toBe(true);
+    expect(isPlausibleImpedance(IMPEDANCE_MAX_OHM)).toBe(true);
+    for (const z of [0, 6553.5, 65535, Number.NaN, Number.POSITIVE_INFINITY, -500]) {
+      expect(isPlausibleImpedance(z)).toBe(false);
+    }
   });
 });

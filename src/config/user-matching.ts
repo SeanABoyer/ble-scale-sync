@@ -9,12 +9,31 @@ export interface MatchResult {
   user: UserConfig | null;
   tier: 'exact' | 'tiebreak' | 'last_known' | 'strategy';
   warning?: string;
+  /**
+   * True when several users fit and nothing about them decided between them,
+   * so `user` is merely the first in config order. A live weigh-in still goes
+   * to that user (the person on the scale can see it and correct it); a stored
+   * record replayed from the scale's memory is dropped instead (D027), since
+   * nobody is there to notice it landed in the wrong account.
+   */
+  ambiguous?: boolean;
 }
 
 // --- Helpers ---
 
 function inRange(weight: number, user: UserConfig): boolean {
   return weight >= user.weight_range.min && weight <= user.weight_range.max;
+}
+
+/**
+ * True when a weight falls outside a user's configured range.
+ *
+ * Exported so the processor's `out_of_range` guard and the matcher share ONE
+ * definition of the boundary. Both ends are inclusive, matching `inRange`
+ * above: a weight exactly on `min` or `max` is in range (#395).
+ */
+export function isOutOfRange(user: UserConfig, weight: number): boolean {
+  return !inRange(weight, user);
 }
 
 function rangeMidpoint(user: UserConfig): number {
@@ -103,7 +122,7 @@ export function matchUserByWeight(
     const first = rangeMatches[0];
     const warning = `Multiple range matches for ${weight} kg — using ${first.name} (config order)`;
     log.warn(warning);
-    return { user: first, tier: 'tiebreak', warning };
+    return { user: first, tier: 'tiebreak', warning, ambiguous: true };
   }
 
   // Tier 4: no range match — try last_known_weight

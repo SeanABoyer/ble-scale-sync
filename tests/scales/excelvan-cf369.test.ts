@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ExcelvanCF369Adapter } from '../../src/scales/excelvan-cf369.js';
-import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
   defaultProfile,
+  makeConnectionContext,
   assertPayloadRanges,
 } from '../helpers/scale-test-utils.js';
+import { WEIGHT_ONLY_HOLD_MS } from '../../src/scales/body-comp-helpers.js';
 
 function makeAdapter() {
   return new ExcelvanCF369Adapter();
@@ -103,15 +104,37 @@ describe('ExcelvanCF369Adapter', () => {
       expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(true);
     });
 
-    it('returns false when fat is not set (incomplete frame)', () => {
+    it('completes a weigh-in without composition after a short hold (D-07, D028)', () => {
+      // A weigh-in the scale could not analyse (socks, a child) used to be
+      // refused here, so the session never produced a reading and ran into its
+      // timeout. Now the weight completes, waits WEIGHT_ONLY_HOLD_MS for a frame
+      // with composition, and resolves weight-only when none comes.
       const adapter = makeAdapter();
       const buf = Buffer.alloc(14);
       buf[0] = 0xcf;
       buf.writeUInt16BE(800, 4);
       buf[6] = 0xff;
-      adapter.parseNotification(buf);
+      const reading = adapter.parseNotification(buf)!;
 
-      expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(false);
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(false);
+      expect(adapter.completionHoldMs).toBe(WEIGHT_ONLY_HOLD_MS);
+    });
+
+    it('resolves at once on the frame that carries composition', () => {
+      const adapter = makeAdapter();
+      const buf = Buffer.alloc(14);
+      buf[0] = 0xcf;
+      buf.writeUInt16BE(800, 4);
+      buf.writeUInt16BE(225, 6);
+      buf[8] = 35;
+      buf.writeUInt16BE(400, 9);
+      buf[11] = 8;
+      buf.writeUInt16BE(550, 12);
+      const reading = adapter.parseNotification(buf)!;
+
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(true);
     });
 
     it('returns false when weight is 0', () => {
@@ -126,12 +149,12 @@ describe('ExcelvanCF369Adapter', () => {
       const writeFn = vi.fn().mockResolvedValue(undefined);
       const profile = defaultProfile({ gender: 'male', height: 183, age: 30 });
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile,
-      };
+      });
 
       await adapter.onConnected(ctx);
 
@@ -156,12 +179,12 @@ describe('ExcelvanCF369Adapter', () => {
       const writeFn = vi.fn().mockResolvedValue(undefined);
       const profile = defaultProfile({ gender: 'female', height: 165, age: 25 });
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile,
-      };
+      });
 
       await adapter.onConnected(ctx);
 
@@ -197,5 +220,46 @@ describe('ExcelvanCF369Adapter', () => {
       const payload = adapter.computeMetrics({ weight: 0, impedance: 0 }, profile);
       expect(payload.weight).toBe(0);
     });
+  });
+});
+
+// #394: adapters are shared singletons and computeMetrics() runs LATER than the
+// parse that produced the reading. On the mqtt-proxy and esphome-proxy watchers
+// the loop awaits processReading() - network exports included - while the
+// watcher is free to open the NEXT session, so onSessionStart() for session N+1
+// can land BEFORE computeMetrics() for session N. Reading the live cache there
+// hands the completed reading somebody else's composition.
+//
+// Each test below interleaves the two in exactly that order. Asserting only on
+// the payload of an uninterrupted session would pass with or without the fix.
+
+describe('ExcelvanCF369Adapter session boundary (#394)', () => {
+  function compFrame(fatTenths: number): Buffer {
+    const buf = Buffer.alloc(14);
+    buf[0] = 0xcf; // marker
+    buf.writeUInt16BE(800, 4);
+    buf.writeUInt16BE(fatTenths, 6);
+    // bone = 3.5 kg, as in the frames above. Left at 0 it is not a measurement,
+    // and buildPayload now discards the whole composition for it (D028).
+    buf[8] = 35;
+    buf.writeUInt16BE(400, 9);
+    buf.writeUInt16BE(550, 12);
+    return buf;
+  }
+
+  it('keeps the completed reading composition when the NEXT session starts first', () => {
+    const a = makeAdapter();
+    const reading = a.parseNotification(compFrame(225))!;
+    a.onSessionStart();
+    const payload = a.computeMetrics(reading, defaultProfile());
+    expect(payload.bodyFatPercent).toBeCloseTo(22.5, 1);
+  });
+
+  it('does not hand a hand-built reading the previous session composition', () => {
+    const a = makeAdapter();
+    a.parseNotification(compFrame(225));
+    a.onSessionStart();
+    const payload = a.computeMetrics({ weight: 80, impedance: 0 }, defaultProfile());
+    expect(payload.bodyFatPercent).not.toBeCloseTo(22.5, 1);
   });
 });

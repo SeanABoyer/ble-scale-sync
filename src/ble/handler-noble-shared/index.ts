@@ -1,0 +1,323 @@
+import type { Peripheral } from '@stoprocent/noble';
+import type { BleDeviceInfo, ScaleAdapter } from '../../interfaces/scale-adapter.js';
+import type { ScanOptions, ScanResult } from '../types.js';
+import type { RawReading } from '../shared.js';
+import { nativePolicy, runGattSession, selectSessionAdapter } from '../session/runner.js';
+import { resolveAdapter } from '../../scales/resolve.js';
+import {
+  bleLog,
+  normalizeUuid,
+  sleep,
+  withTimeout,
+  MAX_CONNECT_RETRIES,
+  GATT_DISCOVERY_TIMEOUT_MS,
+  formatMac,
+} from '../types.js';
+import { wrapChar } from './char.js';
+import { wrapCharacteristics, wrapPeripheral } from './gatt.js';
+import { parseMfgData, parseServiceData, peripheralAddress } from './peripheral.js';
+import { waitForPoweredOn } from './state.js';
+import { connectWithRetries } from './connect.js';
+import { discoverPeripheral } from './discovery.js';
+import { broadcastScan } from './broadcast.js';
+import type { NobleHandlerDeps } from './types.js';
+import { ManufacturerDataCache, safeName } from '../advertisement.js';
+
+export type { NobleApi, NobleHandlerDeps } from './types.js';
+
+/**
+ * Build the Noble-based BLE handler for a specific driver.
+ *
+ * The two driver entrypoints (`handler-noble.ts` for `@stoprocent/noble`,
+ * `handler-noble-legacy.ts` for `@abandonware/noble`) supply their own Noble
+ * instance and a `getState` accessor; everything else is shared here (#181).
+ */
+export function createNobleHandler({ noble, getState }: NobleHandlerDeps) {
+  // ─── Exports ────────────────────────────────────────────────────────────────
+
+  /**
+   * Scan for a BLE scale, read weight + impedance, and compute body composition.
+   */
+  let adapterWarningLogged = false;
+
+  /**
+   * The last non-empty manufacturer data each address advertised in this
+   * process, for the GATT session handoff only (#463, D071). Both noble
+   * drivers fold every report into one Peripheral, but a report without
+   * manufacturer data overwrites it there: the Windows (WinRT) and macOS
+   * bindings hand an empty buffer for it. So the session of a scale whose
+   * last report before the connect had none would go without, as on node-ble.
+   * Never fed to the resolver, as on the other transports.
+   */
+  const mfgCache = new ManufacturerDataCache();
+
+  async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
+    if (opts.bleAdapter && !adapterWarningLogged) {
+      bleLog.warn(
+        `ble.adapter='${opts.bleAdapter}' is only supported with node-ble (Linux default). ` +
+          `Ignored when using Noble.`,
+      );
+      adapterWarningLogged = true;
+    }
+
+    const { targetMac, adapters, profile, scaleAuth, onLiveData, onLiveWeight, abortSignal } = opts;
+    const { readingTimeoutMs } = opts;
+
+    try {
+      await waitForPoweredOn(noble, getState);
+
+      const { peripheral, matchedAdapter: discoveredAdapter } = await discoverPeripheral(
+        noble,
+        adapters,
+        targetMac,
+        abortSignal,
+      );
+
+      // Match adapter from advertisement (needed for target-MAC mode where
+      // discoveredAdapter is deferred until post-connect).
+      const connectable = peripheral.connectable !== false;
+      const mfgData = parseMfgData(peripheral.advertisement?.manufacturerData);
+      const sessionKey = peripheralAddress(peripheral).replace(/[:-]/g, '').toUpperCase();
+      mfgCache.remember({ manufacturerData: mfgData }, sessionKey);
+      const advName = peripheral.advertisement?.localName ?? '';
+      const advSvcUuids = (peripheral.advertisement?.serviceUuids ?? []).map(normalizeUuid);
+      let broadcastAdapter = discoveredAdapter;
+      if (!broadcastAdapter) {
+        const info: BleDeviceInfo = {
+          localName: advName,
+          address: peripheral.address ? formatMac(peripheral.address) : undefined,
+          serviceUuids: advSvcUuids,
+          manufacturerData: mfgData,
+          serviceData: parseServiceData(peripheral),
+        };
+        broadcastAdapter = resolveAdapter(info, adapters);
+      }
+
+      // Use broadcast scanning when the device is non-connectable or the matched
+      // adapter prefers passive advertisement decoding over a GATT connection.
+      if (!connectable || broadcastAdapter?.preferPassive) {
+        if (
+          broadcastAdapter &&
+          (broadcastAdapter.parseBroadcast || broadcastAdapter.parseServiceData)
+        ) {
+          if (!connectable) {
+            bleLog.info(
+              `Device is broadcast-only (non-connectable). Using advertisement-based reading.`,
+            );
+          } else {
+            bleLog.info(`Adapter prefers passive mode. Using advertisement-based reading.`);
+          }
+          return await broadcastScan(noble, broadcastAdapter, peripheral, {
+            abortSignal,
+            onLiveData,
+            onLiveWeight,
+          });
+        }
+
+        if (!connectable) {
+          bleLog.warn('Device is broadcast-only but no adapter supports advertisement parsing.');
+        }
+      }
+
+      await connectWithRetries(noble, peripheral, MAX_CONNECT_RETRIES);
+      try {
+        bleLog.info('Connected. Discovering services...');
+
+        // Sequential per-service discovery — one GATT request at a time.
+        // discoverAllServicesAndCharacteristicsAsync() fires all per-service
+        // characteristic discoveries in parallel (peripheral.js line 124-141),
+        // which overwhelms low-power BLE devices on WinRT.
+        const services = await withTimeout(
+          (async () => {
+            const svcs = await peripheral.discoverServicesAsync();
+            for (const svc of svcs) {
+              try {
+                await svc.discoverCharacteristicsAsync();
+              } catch {
+                // WinRT may return AccessDenied on first attempt for custom services.
+                // Retrying after a short delay lets WinRT's GATT cache settle
+                // (mirrors old @abandonware/noble's accidental two-call warm-up).
+                await sleep(1000);
+                await svc.discoverCharacteristicsAsync();
+              }
+            }
+            return svcs;
+          })(),
+          GATT_DISCOVERY_TIMEOUT_MS,
+          'GATT service discovery timed out',
+        );
+
+        let matchedAdapter: ScaleAdapter;
+
+        if (discoveredAdapter) {
+          matchedAdapter = discoveredAdapter;
+        } else {
+          // Target-MAC mode: match adapter post-connect using full service list
+          // and the discovered characteristics, so char-aware adapters (#177, #235)
+          // can disambiguate devices that share a generic vendor service (fff0).
+          // Target-MAC mode skips the discovery-time match, so this is the ONLY
+          // adapter resolution for a configured scale_mac, and it must carry both
+          // kinds of evidence. resolveAfterDiscovery keeps them apart: adapters
+          // read serviceUuids as the ADVERTISED list, so a GATT-only service must
+          // not overturn what the advertisement identified (a Hoffen taken by MGB
+          // on its 0xFFB0 GATT service, an ES-WBE28 by QN on 0xFFE0). The advertised
+          // half still carries the manufacturer data: the Hutbit's d618 is
+          // advertised (AD type 0x03) and is not known to be a GATT primary
+          // service, and its signature check needs the two together (#278).
+          const discoveredUuids = services.map((s) => normalizeUuid(s.uuid));
+          const characteristicUuids = services.flatMap((s) =>
+            (s.characteristics ?? []).map((c) => normalizeUuid(c.uuid)),
+          );
+          const name = peripheral.advertisement?.localName ?? '';
+          bleLog.debug(`Services: [${discoveredUuids.join(', ')}]`);
+
+          // Manufacturer data matters here too, for the same reason: adapters
+          // that fingerprint the advertisement (the Lefu OEM signature #278,
+          // Beurer 0x0611, Mi Scale, QN) silently lost that signal without it,
+          // so an OEM-rebranded unit fell through to a wrong adapter.
+          const advertised: BleDeviceInfo = {
+            localName: name,
+            address: peripheral.address ? formatMac(peripheral.address) : undefined,
+            serviceUuids: (peripheral.advertisement?.serviceUuids ?? []).map(normalizeUuid),
+            manufacturerData: parseMfgData(peripheral.advertisement?.manufacturerData),
+            serviceData: parseServiceData(peripheral),
+          };
+          const serviceUuids = [...new Set([...advertised.serviceUuids, ...discoveredUuids])];
+          const found = selectSessionAdapter(
+            advertised,
+            { serviceUuids: discoveredUuids, characteristicUuids },
+            adapters,
+          );
+          if (!found) {
+            throw new Error(
+              `Device found (${safeName(name)}) but no adapter recognized it. ` +
+                `Services: [${serviceUuids.join(', ')}]. ` +
+                `Adapters: ${adapters.map((a) => a.name).join(', ')}`,
+            );
+          }
+          matchedAdapter = found;
+        }
+
+        bleLog.info(`Matched adapter: ${matchedAdapter.name}`);
+
+        const charMap = wrapCharacteristics(services);
+        // Held in a variable so the abandonment cleanup below can reach the
+        // same wrapper the session registered its disconnect callback on.
+        const bleDevice = wrapPeripheral(peripheral);
+        const ownMfg = parseMfgData(peripheral.advertisement?.manufacturerData);
+        mfgCache.remember({ manufacturerData: ownMfg }, sessionKey);
+        const sessionMfg = mfgCache.forSession({ manufacturerData: ownMfg }, sessionKey);
+        if (sessionMfg && sessionMfg !== ownMfg) {
+          bleLog.debug(
+            `${sessionKey} advertised no manufacturer data this time; the session gets what ` +
+              'it advertised earlier in this run (#463)',
+          );
+        }
+        // Bounded like the node-ble path: without this the reading phase relies
+        // entirely on the peripheral eventually disconnecting, so a stalled GATT
+        // session wedges the process (#283).
+        const raw = await runGattSession(
+          {
+            charMap,
+            device: bleDevice,
+            adapter: matchedAdapter,
+            profile,
+            address: sessionKey,
+            onLiveData,
+            scaleAuth,
+            deviceName: peripheral.advertisement?.localName,
+            manufacturerData: sessionMfg,
+          },
+          nativePolicy(readingTimeoutMs),
+        );
+
+        return raw;
+      } finally {
+        try {
+          await peripheral.disconnectAsync();
+        } catch {
+          /* ignore */
+        }
+      }
+    } finally {
+      // Safety net: stop any leftover scanning (targeted — not removeAllListeners)
+      noble.stopScanningAsync().catch(() => {});
+    }
+  }
+
+  /**
+   * Scan for nearby BLE devices and identify recognized scales.
+   */
+  async function scanDevices(adapters: ScaleAdapter[], durationMs = 15_000): Promise<ScanResult[]> {
+    await waitForPoweredOn(noble, getState);
+
+    const results: ScanResult[] = [];
+    const seen = new Set<string>();
+
+    const onDiscover = (peripheral: Peripheral): void => {
+      const addr = peripheralAddress(peripheral);
+      if (seen.has(addr)) return;
+      seen.add(addr);
+
+      // The sentinel is for display only. It must NOT reach `matches()`: it is
+      // a truthy string, and adapters that branch on whether an advertisement
+      // carries a name would read a nameless device as named, so this tool
+      // would report an adapter the read path does not choose. `npm run scan`
+      // is what users are told to run to fill in `ble.force_scale_adapter`, so
+      // a wrong answer here is acted on.
+      const localName = peripheral.advertisement?.localName ?? '';
+      const svcUuids = (peripheral.advertisement?.serviceUuids ?? []).map(normalizeUuid);
+      const mfgData = parseMfgData(peripheral.advertisement?.manufacturerData);
+      // Same fields as discoverPeripheral builds, address and service data
+      // included: adapters that match on the MAC echo or on service data would
+      // otherwise be reported here as unrecognised while the read path picks
+      // them (B-14).
+      const info: BleDeviceInfo = {
+        localName,
+        address: peripheral.address ? formatMac(peripheral.address) : undefined,
+        serviceUuids: svcUuids,
+        manufacturerData: mfgData,
+        serviceData: parseServiceData(peripheral),
+      };
+      const matched = resolveAdapter(info, adapters);
+
+      results.push({
+        address: addr,
+        name: safeName(localName) || '(unknown)',
+        matchedAdapter: matched?.name,
+      });
+    };
+
+    noble.on('discover', onDiscover);
+    await noble.startScanningAsync([], true);
+
+    await sleep(durationMs);
+
+    noble.removeListener('discover', onDiscover);
+    try {
+      await noble.stopScanningAsync();
+    } catch {
+      /* ignore */
+    }
+
+    return results;
+  }
+
+  return {
+    scanAndReadRaw,
+    scanDevices,
+    /** Test-only export of private helpers (#163, #283). */
+    // broadcastScan takes the Noble instance explicitly now that it lives in
+    // its own module, so bind it here rather than changing the three-argument
+    // shape the tests in handler-noble.test.ts and handler-noble-legacy.test.ts
+    // call it with.
+    _internals: {
+      broadcastScan: (
+        adapter: Parameters<typeof broadcastScan>[1],
+        peripheral: Parameters<typeof broadcastScan>[2],
+        opts: Parameters<typeof broadcastScan>[3],
+      ) => broadcastScan(noble, adapter, peripheral, opts),
+      wrapChar,
+    },
+  };
+}

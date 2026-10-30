@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { isLoopback } from '../ble/loopback.js';
 import { isValidScaleId, SCALE_ID_HINT } from '../ble/scale-id.js';
+import { cliCommand } from '../cli-invocation.js';
+import { findTokenDirCollisions } from './token-dirs.js';
+import { QN_BLE_OPTIONS } from '../scales/qn-scale/options.js';
+import { RMSC04_BLE_OPTIONS } from '../scales/renpho-msc04-options.js';
 
 // --- Sub-schemas ---
 
@@ -50,6 +54,28 @@ export const EsphomeProxySchema = z
 
 export type EsphomeEndpointConfig = z.infer<typeof EsphomeEndpointSchema>;
 
+/**
+ * Home Assistant as the BLE radio: the app subscribes to HA's
+ * `bluetooth/subscribe_advertisements` websocket stream, which carries every
+ * advertisement any HA Bluetooth scanner hears (local adapter, ESPHome proxies,
+ * SMLIGHT SLZB, Shelly). Passive only; scales that need a GATT connection are
+ * not reachable this way.
+ */
+export const HaBluetoothSchema = z.object({
+  url: z
+    .string()
+    .min(1, 'Home Assistant URL is required')
+    .refine((v) => /^(https?|wss?):\/\//.test(v), {
+      message: 'Must start with http://, https://, ws:// or wss://',
+    }),
+  // Long-lived access token of an administrator user; the subscription is
+  // admin-only. Keep it in .env and reference it as ${HA_TOKEN}.
+  token: z.string().min(1, 'Home Assistant long-lived access token is required'),
+  // Optional: only accept advertisements heard by this HA scanner (its `source`
+  // id as shown in HA's Bluetooth advertisement monitor, e.g. the proxy's MAC).
+  source: z.string().optional().nullable(),
+});
+
 export const MqttProxySchema = z
   .object({
     broker_url: z
@@ -78,20 +104,29 @@ export const MqttProxySchema = z
           'Set to false to use the legacy host-initiated connect flow.',
       ),
   })
-  .refine(
-    (c) => {
-      if (c.broker_url) return true;
-      if (isLoopback(c.embedded_broker_bind)) return true;
-      return !!c.username;
-    },
-    {
+  // A LAN-exposed embedded broker needs a username AND a password. Checking
+  // only the username let a missing or empty password through, and the broker
+  // then accepted that username with an empty password from anyone on the LAN.
+  .superRefine((c, ctx) => {
+    if (c.broker_url) return;
+    if (isLoopback(c.embedded_broker_bind)) return;
+    if (c.username && c.password) return;
+    ctx.addIssue({
+      code: 'custom',
       message:
         'Embedded broker bound to a non-loopback interface must have username/password set. ' +
-        'Either add mqtt_proxy.username + mqtt_proxy.password, or change embedded_broker_bind ' +
-        'to 127.0.0.1.',
-      path: ['username'],
-    },
-  );
+        'Either add mqtt_proxy.username + mqtt_proxy.password (non-empty), or change ' +
+        'embedded_broker_bind to 127.0.0.1.',
+      path: [c.username ? 'password' : 'username'],
+    });
+  });
+
+/**
+ * `ble.*` keys a scale adapter owns (D076): the adapter module defines their
+ * schema, BleSchema validates them, and buildAdapterRuntimeConfig passes each
+ * one to configure() without a per-key mapping.
+ */
+export const ADAPTER_BLE_OPTIONS = { ...QN_BLE_OPTIONS, ...RMSC04_BLE_OPTIONS };
 
 export const BleSchema = z
   .object({
@@ -108,7 +143,7 @@ export const BleSchema = z
       .optional()
       .nullable(),
     noble_driver: z.enum(['abandonware', 'stoprocent']).optional().nullable(),
-    handler: z.enum(['auto', 'mqtt-proxy', 'esphome-proxy']).default('auto'),
+    handler: z.enum(['auto', 'mqtt-proxy', 'esphome-proxy', 'ha-bluetooth']).default('auto'),
     adapter: z
       .string()
       .regex(/^hci\d+$/, 'Must be a Linux HCI adapter name (e.g., hci0, hci1)')
@@ -122,48 +157,109 @@ export const BleSchema = z
     force_scale_adapter: z.string().min(1).optional().nullable(),
     /**
      * Seconds of scale silence that end one GATT session (default 120); every
-     * notification restarts the clock. Native BLE handlers only; the mqtt-proxy
-     * and esphome-proxy transports ignore it. Some scales refuse to run a
-     * standalone weigh-in while a host holds the session open (the Beurer BF500
-     * shows "APP", #83), so a shorter session frees the scale sooner. The cost
-     * is more Bluetooth adapter churn per hour, since a timed-out read resets
-     * the adapter on node-ble and disconnects on Noble.
+     * notification restarts the clock, except a reply the scale sends to our own
+     * command (D070). Native BLE handlers and the single-shot mqtt-proxy scan;
+     * esphome-proxy and the mqtt-proxy watcher (continuous mode) ignore it. Some
+     * scales refuse to run a standalone weigh-in while a host holds the session
+     * open (the Beurer BF500 shows "APP", #83), so a shorter session frees the
+     * scale sooner. The cost is more Bluetooth adapter churn per hour, since a
+     * timed-out read resets the adapter on node-ble and disconnects on Noble.
      */
     session_timeout_sec: z.number().int().min(5).max(600).optional().nullable(),
+    // Spread in place, not .extend()ed: parsed key order is shape order.
+    ...ADAPTER_BLE_OPTIONS,
     /**
-     * Protocol byte the QN handshake echoes back to the scale (#75, #331).
+     * Delete a bond the scale has forgotten and pair again, instead of stopping
+     * at the diagnostic (#290, #335).
      *
-     * The QN family disagrees about which value its firmware accepts, and the
-     * wrong one is silent rather than an error: the scale acknowledges the whole
-     * handshake and never streams a weight. The scale-info frame length picks a
-     * default (0 for the 18-byte variant, the value the scale itself sent for
-     * anything longer); set this when a scale runs the full handshake and then
-     * reports nothing, or when its scale-info frame is unreliable in transit
-     * (proxy transports) and sessions without it open on the wrong byte.
+     * When a peripheral discards its half of the pairing, BlueZ replays the
+     * dead key forever: every connect fails during encryption and the host
+     * never invalidates anything, so the scale is unreachable until someone
+     * runs `bluetoothctl remove` by hand. With this on, the bond is cleared once
+     * per connect, on three attempts that show the scale refusing the key.
+     * Every BlueZ gives a refused key and a weak radio link the same
+     * `le-connection-abort-by-local` (#471), so the error alone is not enough.
+     * BlueZ 5.83 and later (Home Assistant OS 16.2 and later) say why a
+     * connection ended, and only a reported refusal counts there. With older
+     * BlueZ it goes by how the connection ended: over a refused key this host
+     * ends it itself, shortly after the error, while a weak radio link drops
+     * it with the error. A connect timeout never counts.
+     *
+     * Opt-in, because on these scales a bond dropped in error costs a physical
+     * re-pair at the device.
      */
-    qn_protocol_byte: z.number().int().min(0).max(255).optional().nullable(),
+    auto_clear_stale_bond: z.boolean().optional().nullable(),
     /**
-     * Payload byte of the QN A00D history-response frame, default 0xFE (#235,
-     * #75, #331).
+     * Longest wait, in minutes, before a bonding scale is connected and asked
+     * to pair again after a pairing nobody confirmed on it (#471, D063).
+     * Default 60; 0 tries again on every scan, as releases before it did.
      *
-     * The handshake answers the scale's 0x21 config request with
-     * `a0 0d 04 <byte> 00 ...`. The default comes from openScale's QNHandler,
-     * which took it from an ES-30M capture. Two vendor-app captures on other
-     * firmware in the same family send 0xFC there instead: a GE CS 10 G (20-byte
-     * dialect) and an Arboleaf QN-Scale V39 (19-byte es26m), both from sessions
-     * that produced a reading in the vendor app while ble-scale-sync saw the
-     * handshake acknowledged and then silence.
+     * A Beurer scale shows a fresh code for every pairing and waits for SET.
+     * Nobody standing there used to mean a new code every two or three
+     * minutes, all night. Now, once our pairing agent has handled such a
+     * request and the cycle ends with the scale still unpaired, the scale is
+     * not connected to again for 2 minutes three times, then twice as long
+     * each time (4, 8, 16, 32 minutes and so on) until the wait reaches this
+     * cap, and then for the cap each time (`pairingRetryDelayMs`). It goes at
+     * once when the scale comes back after a scan without it, when its
+     * advertisement shows a new weigh-in (Beurer BF720 family), when it is
+     * paired by other means, or after a restart.
      *
-     * What the byte selects is NOT decoded. openScale annotates it only as
-     * "Payload", and it demonstrably does not gate the live 0x10 stream, since
-     * openScale receives those frames while sending 0xFE. So this ships as a
-     * setting rather than a changed default: on a scale that reads today, 0xFE
-     * is the value with evidence behind it, and a wrong choice here is silent in
-     * exactly the way `qn_protocol_byte` is.
+     * Read on every cycle (hot-swap). node-ble only, and only in continuous
+     * mode: a single run is a fresh process and starts without the memory.
      */
-    qn_report_byte: z.number().int().min(0).max(255).optional().nullable(),
+    pairing_retry_max_min: z.number().int().min(0).max(1440).optional().nullable(),
+    /**
+     * Power-cycle the HCI controller with `btmgmt` after every GATT session
+     * (#80). Default true; `false` skips that one step and nothing else.
+     *
+     * The cycle exists for the Broadcom "zombie discovery" state, where BlueZ
+     * reports Discovering=true while the controller has stopped scanning.
+     * This switch was added to test whether the cycle makes a Beurer scale
+     * reject its stored key on the next connect; #417 showed it is not the
+     * cause (that is the missing host IdKey, see adapter_privacy), and it is
+     * kept as a diagnostic switch. The D-Bus reset, the failed-GATT cleanup and
+     * the reactive recovery tiers all still run, and so does the reactive
+     * power-cycle when BlueZ does not complete a Disconnect (a link it keeps
+     * listing as connected, #472, D062).
+     *
+     * node-ble only: noble resets the adapter only reactively, and the proxy
+     * transports never touch the host adapter.
+     */
+    preemptive_adapter_reset: z.boolean().optional().nullable(),
+    /**
+     * Turn on LE privacy on the host adapter with an IRK derived from its
+     * address, so pairing hands the scale a host identity key (#417).
+     *
+     * A Beurer BF915 keeps a bond only from a peer that distributed an IRK, and
+     * Linux distributes one only while the adapter has privacy enabled, which
+     * is off by default. Without it every bond BlueZ makes is rejected on the
+     * next reconnect with `PIN or Key Missing`.
+     *
+     * Off by default because privacy is adapter-wide: every LE connection and
+     * active scan on that adapter, including Home Assistant's own Bluetooth
+     * integration, then uses a random address. Read once at start-up
+     * (restart-required). node-ble on Linux only.
+     */
+    adapter_privacy: z.boolean().optional().nullable(),
+    /**
+     * Minutes of total advertisement silence before a proxy transport is
+     * treated as wedged rather than idle (#281). 0 disables the check.
+     *
+     * `mqtt-proxy` and `esphome-proxy` have no in-app liveness recovery: a
+     * wedged link and a house where nobody has weighed in look identical,
+     * because the reading wait never resolves in either case. Advertisements
+     * are the signal that separates them, since they flow constantly from any
+     * nearby device while the link is alive.
+     *
+     * The window is deliberately long. Getting this wrong means restart-looping
+     * somebody whose proxy sits somewhere genuinely quiet, which is worse than
+     * the bug it fixes.
+     */
+    proxy_liveness_timeout_min: z.number().int().min(0).max(1440).optional().nullable(),
     mqtt_proxy: MqttProxySchema.optional(),
     esphome_proxy: EsphomeProxySchema.optional(),
+    ha_bluetooth: HaBluetoothSchema.optional(),
   })
   .refine((ble) => ble.handler !== 'mqtt-proxy' || ble.mqtt_proxy !== undefined, {
     message: 'mqtt_proxy config is required when handler is "mqtt-proxy"',
@@ -172,16 +268,23 @@ export const BleSchema = z
   .refine((ble) => ble.handler !== 'esphome-proxy' || ble.esphome_proxy !== undefined, {
     message: 'esphome_proxy config is required when handler is "esphome-proxy"',
     path: ['esphome_proxy'],
+  })
+  .refine((ble) => ble.handler !== 'ha-bluetooth' || ble.ha_bluetooth !== undefined, {
+    message: 'ha_bluetooth config is required when handler is "ha-bluetooth"',
+    path: ['ha_bluetooth'],
   });
 // NOTE: force_scale_adapter also requires a scale_mac, but that pairing is NOT
 // checked here. Schema validation runs before applyEnvOverrides (yaml-load.ts),
 // so a config.yaml that names a forced adapter and takes its MAC from the
 // documented SCALE_MAC Docker override would be rejected while being perfectly
-// valid. The check lives in src/index.ts, after the effective MAC is known.
+// valid. The check lives in src/run.ts (and in forced-adapter.ts for
+// `validate`), after the effective MAC is known.
 
 export const ScaleSchema = z.object({
   weight_unit: z.enum(['kg', 'lbs']).default('kg'),
   height_unit: z.enum(['cm', 'in']).default('cm'),
+  /** Unit requested on the physical scale; independent from exported values. */
+  display_unit: z.enum(['weight_unit', 'kg', 'lbs', 'st']).default('weight_unit'),
 });
 
 export const ExporterEntrySchema = z
@@ -199,6 +302,31 @@ const WeightRangeSchema = z
     message: 'max must be greater than min',
   });
 
+/**
+ * True for a date string that names a day that actually exists, and is not in
+ * the future.
+ *
+ * The regex above only fixes the SHAPE, so `2024-02-31` and `9999-99-99` both
+ * passed validation and went straight into the age arithmetic that drives every
+ * body-composition estimate. `new Date('2024-02-31')` is not a safety net
+ * either: it normalises to 2024-03-02 rather than failing, which is why the
+ * components are compared back against the parsed date instead of merely
+ * checking for NaN.
+ */
+function isRealCalendarDate(value: string): boolean {
+  const [y, m, d] = value.split('-').map(Number);
+  const parsed = new Date(Date.UTC(y, m - 1, d));
+  if (Number.isNaN(parsed.getTime())) return false;
+  if (
+    parsed.getUTCFullYear() !== y ||
+    parsed.getUTCMonth() !== m - 1 ||
+    parsed.getUTCDate() !== d
+  ) {
+    return false;
+  }
+  return parsed.getTime() <= Date.now();
+}
+
 export const UserSchema = z.object({
   name: z.string().min(1, 'User name is required'),
   slug: z
@@ -207,7 +335,10 @@ export const UserSchema = z.object({
   height: z.number().positive('Must be a positive number (e.g., 183)'),
   birth_date: z
     .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be a date in YYYY-MM-DD format (e.g., "1990-06-15")'),
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Must be a date in YYYY-MM-DD format (e.g., "1990-06-15")')
+    .refine(isRealCalendarDate, {
+      message: 'Must be a real calendar date, not in the future (e.g., "1990-06-15")',
+    }),
   gender: z.enum(['male', 'female']),
   is_athlete: z.boolean(),
   weight_range: WeightRangeSchema,
@@ -233,16 +364,31 @@ export const UserSchema = z.object({
    * existing one (#335).
    *
    * A SIG user record exists only after User Control Point "Register New User",
-   * and normally only the vendor app performs it. The profiles created in the
-   * scale's own menu are display-side records for its body-composition maths,
-   * not SIG users, so a scale set up that way refuses every consent code from
-   * any other client: there is no record it is entitled to.
+   * and normally only the vendor app performs it, so a scale set up that way
+   * refuses every consent code from any other client: there is no record it is
+   * entitled to.
+   *
+   * NOT the first move on a BF915, where the scale's own menu profiles ARE the
+   * SIG slots: a factory reset followed by creating U:1 in the menu, with no
+   * BLE operation at all, leaves Register New User returning index 2, and
+   * consent on index 1 returns the values typed into the menu. On that model
+   * the profile and its displayed four-digit consent code come from the menu
+   * and this only burns slots (#335).
    *
    * One-shot and opt-in, because it writes a record to the device and the slots
    * are finite. Turn it on once, read the assigned index out of the log, put
    * that in `beurer_user_index`, then turn it off.
    */
   beurer_register_new_user: z.boolean().optional(),
+  /**
+   * false: a weigh-in the scale measured no body composition for (no usable
+   * impedance, no body fat of its own, or one the adapter did not use) exports
+   * no body fat, water, bone mass, muscle mass, visceral fat or physique rating
+   * instead of estimating them from BMI (#497). Weight, impedance, BMI, BMR and
+   * metabolic age still go out. Per user, so a weigh-in follows the matched
+   * user's choice. No default, so a config without the key loads as before.
+   */
+  estimate_body_composition: z.boolean().optional(),
 });
 
 export const RuntimeSchema = z.object({
@@ -262,32 +408,147 @@ export const RuntimeSchema = z.object({
    * deploys are preferred. Default true.
    */
   watch_config: z.boolean().default(true),
+  /**
+   * Seconds to wait after a continuous-mode cycle that found no scale, when the
+   * radio itself is healthy (`bleFailureKind === 'idle'`).
+   *
+   * Idle cycles used to go through the same exponential failure backoff as a
+   * dead radio, so a house where nobody had stepped on the scale reached the
+   * 60 s cap within five cycles and then spent a minute per cycle not
+   * listening. A scale that only advertises while somebody is standing on it
+   * can weigh in entirely inside that window (#398).
+   *
+   * Real failures - GATT errors, a wedged controller - keep the 5 s -> 60 s
+   * backoff, which is the right thing for those.
+   */
+  idle_rescan_delay: z.number().int().min(0).max(3600).default(5),
+  /**
+   * Minimum seconds to wait after a continuous-mode session that connected,
+   * heard the scale and then went quiet until its idle timeout
+   * (`bleFailureKind === 'no-reading'`, D041), when that is longer than the
+   * 5 s -> 60 s retry backoff (#475). The backoff still advances; 0 keeps it
+   * exactly as before.
+   *
+   * For a scale that accepts a connection all the time and keeps its weigh-ins
+   * until the next one: a Beurer BF915 showed PAIR through 10 to 15 sessions an
+   * hour, all day. A weigh-in made during the wait arrives with the next
+   * session; more than 5 minutes late it is a past measurement, which only the
+   * exporters that can backdate receive (D027). A scale that does not keep its
+   * weigh-ins can lose one made during the wait.
+   *
+   * node-ble only: nothing else tags 'no-reading'. Must stay far below
+   * 2^31 - 1 ms, above which setTimeout fires after 1 ms.
+   */
+  no_reading_rescan_delay: z.number().int().min(0).max(3600).default(0),
+  /**
+   * Keep a reading whose export failed and retry it on a later cycle (#412).
+   *
+   * On by default. The failure it covers is silent and total: a cloud target
+   * that is down for an hour loses the weigh-in with no artefact anywhere, and
+   * a reporter lost four that way in a week. Bounded at 72 hours, 5 attempts
+   * and 50 entries, and only for exporters that can record a past reading.
+   *
+   * Turning it off restores the previous behaviour exactly, including keeping
+   * no queue on disk (the de-duplication marks in `.scale-dedup-marks.json`
+   * are written either way). See ADR D014: this persists body composition and a user
+   * name by default, which is why it is a decision and not just a flag.
+   */
+  retry_failed_exports: z.boolean().default(true),
 });
 
 export const DockerSchema = z.object({
   mode: z.enum(['pull', 'build']).default('pull'),
 });
 
-export const AppConfigSchema = z.object({
+const AppConfigObjectSchema = z.object({
   version: z.literal(1),
   ble: BleSchema.optional(),
-  scale: ScaleSchema.default({ weight_unit: 'kg', height_unit: 'cm' }),
+  scale: ScaleSchema.default({
+    weight_unit: 'kg',
+    height_unit: 'cm',
+    display_unit: 'weight_unit',
+  }),
   unknown_user: z.enum(['nearest', 'log', 'ignore']).default('nearest'),
-  users: z.array(UserSchema).min(1, 'At least one user is required'),
+  /**
+   * What to do with a reading that no configured user's `weight_range` covers.
+   *
+   * `warn` (default) is the behaviour every install has had: log it and export
+   * it anyway. `skip` stops before the exporters and before the
+   * `last_known_weight` write.
+   *
+   * The distinction matters because `weight_range` was only ever a MATCHING
+   * input, never a guard. A reading nobody's range covers still resolves to
+   * somebody, through the single-user tier or the `last_known_weight` proximity
+   * tier, and then exports normally. A reporter stood on the scale holding a
+   * suitcase, got 178 kg at 0 ohm, and it went to Garmin and to a retained MQTT
+   * topic. Worse, `last_known_weight` was rewritten to 178, so the NEXT genuine
+   * weigh-in tie-broke to the other user and was dropped (#395).
+   *
+   * The default stays `warn` so no existing install silently starts discarding
+   * readings, but `skip` is the safer setting for a multi-user household.
+   */
+  out_of_range: z.enum(['warn', 'skip']).default('warn'),
+  users: z
+    .array(UserSchema)
+    .min(1, 'At least one user is required')
+    /**
+     * The slug is an identity, not a label. Nothing enforced that it was
+     * unique, and everything downstream assumes it is: `getExportersForUser`
+     * caches by slug and resolves the user with `users.find`, so a second user
+     * with the same slug silently inherited the first one's exporters - and
+     * with them the first one's Garmin account. The exporter cache made it
+     * stick for the life of the process.
+     */
+    .superRefine((users, ctx) => {
+      const seen = new Set<string>();
+      users.forEach((user, i) => {
+        if (seen.has(user.slug)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'slug'],
+            message:
+              `Duplicate user slug '${user.slug}': each user needs its own slug. ` +
+              'Exporters, the retry queue and last_known_weight are all keyed by it.',
+          });
+          return;
+        }
+        seen.add(user.slug);
+      });
+    }),
   global_exporters: z.array(ExporterEntrySchema).optional(),
   runtime: RuntimeSchema.optional(),
   docker: DockerSchema.optional(),
   update_check: z.boolean().default(true),
 });
 
+/**
+ * The config schema for a config.yaml in `configDir`.
+ *
+ * Two accounts sharing one token directory means one user's readings upload
+ * into the other's account; see findTokenDirCollisions. A relative token_dir
+ * is taken from the config's own directory (F-11), so the check needs to know
+ * it. Without one it compares from the working directory.
+ */
+export function createAppConfigSchema(configDir?: string) {
+  return AppConfigObjectSchema.superRefine((config, ctx) => {
+    for (const c of findTokenDirCollisions(config, configDir)) {
+      ctx.addIssue({ code: 'custom', path: c.path, message: c.message });
+    }
+  });
+}
+
+export const AppConfigSchema = createAppConfigSchema();
+
 // --- Standalone types ---
 
 export type WeightUnit = 'kg' | 'lbs';
+export type ScaleDisplayUnit = WeightUnit | 'st';
 
 // --- Inferred types ---
 
 export type MqttProxyConfig = z.infer<typeof MqttProxySchema>;
 export type EsphomeProxyConfig = z.infer<typeof EsphomeProxySchema>;
+export type HaBluetoothConfig = z.infer<typeof HaBluetoothSchema>;
 export type BleConfig = z.infer<typeof BleSchema>;
 export type ScaleConfig = z.infer<typeof ScaleSchema>;
 export type ExporterEntry = z.infer<typeof ExporterEntrySchema>;
@@ -296,6 +557,7 @@ export type RuntimeConfig = z.infer<typeof RuntimeSchema>;
 export type DockerConfig = z.infer<typeof DockerSchema>;
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 export type UnknownUserStrategy = AppConfig['unknown_user'];
+export type OutOfRangeStrategy = AppConfig['out_of_range'];
 
 // --- Error formatting ---
 
@@ -309,7 +571,9 @@ export function formatConfigError(error: z.ZodError): string {
     lines.push('');
   }
 
-  lines.push("Run 'npm run validate' to check your config, or 'npm run setup' to reconfigure.");
+  lines.push(
+    `Run '${cliCommand('validate')}' to check your config, or '${cliCommand('setup')}' to reconfigure.`,
+  );
 
   return lines.join('\n');
 }

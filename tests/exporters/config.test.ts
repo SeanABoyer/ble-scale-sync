@@ -10,6 +10,42 @@ describe('loadExporterConfig()', () => {
     vi.unstubAllEnvs();
   });
 
+  describe('GARMIN_WEIGHT_ONLY', () => {
+    it('defaults to false when unset', () => {
+      const cfg = loadExporterConfig();
+      expect(cfg.garmin).toEqual({ weightOnly: false });
+    });
+
+    it('parses true', () => {
+      vi.stubEnv('GARMIN_WEIGHT_ONLY', 'true');
+      expect(loadExporterConfig().garmin?.weightOnly).toBe(true);
+    });
+
+    it('parses false', () => {
+      vi.stubEnv('GARMIN_WEIGHT_ONLY', 'false');
+      expect(loadExporterConfig().garmin?.weightOnly).toBe(false);
+    });
+
+    // F-16: config.yaml and the env overrides accept on/off, this did not.
+    it('parses on and off', () => {
+      vi.stubEnv('GARMIN_WEIGHT_ONLY', 'on');
+      expect(loadExporterConfig().garmin?.weightOnly).toBe(true);
+      vi.stubEnv('GARMIN_WEIGHT_ONLY', 'off');
+      expect(loadExporterConfig().garmin?.weightOnly).toBe(false);
+    });
+
+    it('throws on a non-boolean value', () => {
+      vi.stubEnv('GARMIN_WEIGHT_ONLY', 'maybe');
+      expect(() => loadExporterConfig()).toThrow(/GARMIN_WEIGHT_ONLY/);
+    });
+
+    it('is absent when the garmin exporter is not enabled', () => {
+      vi.stubEnv('EXPORTERS', 'file');
+      vi.stubEnv('FILE_PATH', '/tmp/readings.csv');
+      expect(loadExporterConfig().garmin).toBeUndefined();
+    });
+  });
+
   describe('EXPORTERS parsing', () => {
     it('defaults to garmin when EXPORTERS is not set', () => {
       const cfg = loadExporterConfig();
@@ -60,6 +96,48 @@ describe('loadExporterConfig()', () => {
       vi.stubEnv('MQTT_BROKER_URL', 'mqtt://localhost:1883');
       const cfg = loadExporterConfig();
       expect(cfg.exporters).toEqual(['mqtt']);
+    });
+  });
+
+  describe('Dreeve config', () => {
+    it('requires DREEVE_BASE_URL when dreeve is enabled', () => {
+      vi.stubEnv('EXPORTERS', 'dreeve');
+      expect(() => loadExporterConfig()).toThrow(/DREEVE_BASE_URL is required/);
+    });
+
+    it('requires DREEVE_TOKEN when dreeve is enabled', () => {
+      vi.stubEnv('EXPORTERS', 'dreeve');
+      vi.stubEnv('DREEVE_BASE_URL', 'https://fit.example.com');
+      expect(() => loadExporterConfig()).toThrow(/DREEVE_TOKEN is required/);
+    });
+
+    it('requires DREEVE_UNIT_SYSTEM when dreeve is enabled', () => {
+      vi.stubEnv('EXPORTERS', 'dreeve');
+      vi.stubEnv('DREEVE_BASE_URL', 'https://fit.example.com');
+      vi.stubEnv('DREEVE_TOKEN', 'drv_abc123');
+      expect(() => loadExporterConfig()).toThrow(/DREEVE_UNIT_SYSTEM must be metric or imperial/);
+    });
+
+    it('rejects an unknown DREEVE_UNIT_SYSTEM', () => {
+      vi.stubEnv('EXPORTERS', 'dreeve');
+      vi.stubEnv('DREEVE_BASE_URL', 'https://fit.example.com');
+      vi.stubEnv('DREEVE_TOKEN', 'drv_abc123');
+      vi.stubEnv('DREEVE_UNIT_SYSTEM', 'pounds');
+      expect(() => loadExporterConfig()).toThrow(
+        /DREEVE_UNIT_SYSTEM must be metric or imperial.*got 'pounds'/,
+      );
+    });
+
+    it('reads Dreeve configuration with an explicit unit system', () => {
+      vi.stubEnv('EXPORTERS', 'dreeve');
+      vi.stubEnv('DREEVE_BASE_URL', 'https://fit.example.com');
+      vi.stubEnv('DREEVE_TOKEN', 'drv_abc123');
+      vi.stubEnv('DREEVE_UNIT_SYSTEM', 'IMPERIAL');
+      expect(loadExporterConfig().dreeve).toEqual({
+        baseUrl: 'https://fit.example.com',
+        token: 'drv_abc123',
+        unitSystem: 'imperial',
+      });
     });
   });
 
@@ -168,6 +246,14 @@ describe('loadExporterConfig()', () => {
       expect(cfg.webhook!.timeout).toBe(5000);
     });
 
+    // F-16: `Number(raw) || 10_000` turned a typo into the default silently.
+    it('throws on a WEBHOOK_TIMEOUT that is not a whole number', () => {
+      vi.stubEnv('EXPORTERS', 'webhook');
+      vi.stubEnv('WEBHOOK_URL', 'https://example.com/hook');
+      vi.stubEnv('WEBHOOK_TIMEOUT', 'abc');
+      expect(() => loadExporterConfig()).toThrow(/WEBHOOK_TIMEOUT/);
+    });
+
     it('parses valid headers', () => {
       vi.stubEnv('EXPORTERS', 'webhook');
       vi.stubEnv('WEBHOOK_URL', 'https://example.com/hook');
@@ -203,6 +289,20 @@ describe('loadExporterConfig()', () => {
       warnSpy.mockRestore();
     });
 
+    // The typical malformed pair is "Authorization Bearer <token>" with the
+    // colon forgotten. The warning must name the header without its value.
+    it('does not log the value of a malformed header', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.stubEnv('EXPORTERS', 'webhook');
+      vi.stubEnv('WEBHOOK_URL', 'https://example.com/hook');
+      vi.stubEnv('WEBHOOK_HEADERS', 'Authorization Bearer s3cr3t-token');
+      loadExporterConfig();
+      const logged = warnSpy.mock.calls.flat().join('\n');
+      expect(logged).toContain('Authorization');
+      expect(logged).not.toContain('s3cr3t-token');
+      warnSpy.mockRestore();
+    });
+
     it('skips invalid headers with warning', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       vi.stubEnv('EXPORTERS', 'webhook');
@@ -234,11 +334,14 @@ describe('loadExporterConfig()', () => {
       expect(() => loadExporterConfig()).toThrow(/INFLUXDB_TOKEN is required/);
     });
 
-    it('requires INFLUXDB_ORG when influxdb is enabled', () => {
+    // F-16: optional in config.yaml, so InfluxDB v3 (no organizations) must
+    // work through .env as well.
+    it('accepts a missing INFLUXDB_ORG, as InfluxDB v3 has none', () => {
       vi.stubEnv('EXPORTERS', 'influxdb');
-      vi.stubEnv('INFLUXDB_URL', 'http://localhost:8086');
+      vi.stubEnv('INFLUXDB_URL', 'http://localhost:8181');
       vi.stubEnv('INFLUXDB_TOKEN', 'my-token');
-      expect(() => loadExporterConfig()).toThrow(/INFLUXDB_ORG is required/);
+      vi.stubEnv('INFLUXDB_BUCKET', 'my-bucket');
+      expect(loadExporterConfig().influxdb?.org).toBeUndefined();
     });
 
     it('requires INFLUXDB_BUCKET when influxdb is enabled', () => {
@@ -527,6 +630,45 @@ describe('loadExporterConfig()', () => {
       vi.stubEnv('EXPORTERS', 'garmin');
       vi.stubEnv('WGER_TOKEN', 'tok-1');
       expect(loadExporterConfig().wger).toBeUndefined();
+    });
+  });
+
+  describe('HealthLog config', () => {
+    it('requires HEALTHLOG_BASE_URL when healthlog is enabled', () => {
+      vi.stubEnv('EXPORTERS', 'healthlog');
+      vi.stubEnv('HEALTHLOG_TOKEN', 'tok-1');
+      expect(() => loadExporterConfig()).toThrow(/HEALTHLOG_BASE_URL is required/);
+    });
+
+    it('requires HEALTHLOG_TOKEN when healthlog is enabled', () => {
+      vi.stubEnv('EXPORTERS', 'healthlog');
+      vi.stubEnv('HEALTHLOG_BASE_URL', 'https://healthlog.example');
+      expect(() => loadExporterConfig()).toThrow(/HEALTHLOG_TOKEN is required/);
+    });
+
+    it('parses healthlog env vars (sync_measurements defaults true)', () => {
+      vi.stubEnv('EXPORTERS', 'healthlog');
+      vi.stubEnv('HEALTHLOG_BASE_URL', 'https://healthlog.example');
+      vi.stubEnv('HEALTHLOG_TOKEN', 'tok-1');
+      expect(loadExporterConfig().healthlog).toEqual({
+        baseUrl: 'https://healthlog.example',
+        token: 'tok-1',
+        syncMeasurements: true,
+      });
+    });
+
+    it('parses HEALTHLOG_SYNC_MEASUREMENTS=false', () => {
+      vi.stubEnv('EXPORTERS', 'healthlog');
+      vi.stubEnv('HEALTHLOG_BASE_URL', 'https://healthlog.example');
+      vi.stubEnv('HEALTHLOG_TOKEN', 'tok-1');
+      vi.stubEnv('HEALTHLOG_SYNC_MEASUREMENTS', 'false');
+      expect(loadExporterConfig().healthlog?.syncMeasurements).toBe(false);
+    });
+
+    it('does not parse healthlog config when healthlog is not enabled', () => {
+      vi.stubEnv('EXPORTERS', 'garmin');
+      vi.stubEnv('HEALTHLOG_TOKEN', 'tok-1');
+      expect(loadExporterConfig().healthlog).toBeUndefined();
     });
   });
 });

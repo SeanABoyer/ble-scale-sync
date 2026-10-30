@@ -1,15 +1,16 @@
-import type {
-  ScaleAdapter,
-  BleDeviceInfo,
-  BodyComposition,
-} from '../../interfaces/scale-adapter.js';
+import type { ScaleAdapter, BleDeviceInfo } from '../../interfaces/scale-adapter.js';
 import type { MqttProxyConfig } from '../../config/schema.js';
 import type { ScanOptions, ScanResult } from '../types.js';
 import type { RawReading } from '../shared.js';
-import { waitForRawReading } from '../shared.js';
+import { nativePolicy, runGattSession, selectSessionAdapter } from '../session/runner.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement, logAdvert } from '../advertisement.js';
-import { bleLog, normalizeUuid, withTimeout } from '../types.js';
+import {
+  evaluateAdvertisement,
+  logAdvert,
+  readsFromAdvertisement,
+  safeName,
+} from '../advertisement.js';
+import { bleLog, normalizeUuid, withTimeout, formatMac } from '../types.js';
 import { COMMAND_TIMEOUT_MS, topics, type Topics } from './topics.js';
 import { type MqttClient, createMqttClient } from './client.js';
 import { mqttGattConnect, mqttGattDisconnect } from './gatt.js';
@@ -31,6 +32,7 @@ export interface ScanResultEntry {
 export function toBleDeviceInfo(entry: ScanResultEntry): BleDeviceInfo {
   const info: BleDeviceInfo = {
     localName: entry.name,
+    address: formatMac(entry.address),
     serviceUuids: entry.services.map(normalizeUuid),
   };
   if (entry.manufacturer_id != null && entry.manufacturer_data) {
@@ -63,31 +65,42 @@ export async function waitForEsp32Online(client: MqttClient, t: Topics): Promise
     }
   };
   client.on('message', onMessage);
-  await client.subscribeAsync(t.status);
+  try {
+    await client.subscribeAsync(t.status);
+  } catch (err) {
+    // The listener goes on before the subscribe, so a rejected subscribe used
+    // to leave it attached for the rest of this client's life (#404).
+    client.removeListener('message', onMessage);
+    throw err;
+  }
 
   // If we get the retained offline within 2s, fail fast rather than waiting 30s.
   // The main loop's backoff handles retries. But if online arrives within that
   // window we still succeed. Full timeout only applies when no status received.
   const OFFLINE_GRACE_MS = 2_000;
 
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await withTimeout(
       Promise.race([
         promise,
         // After grace period, if we saw offline, reject early
-        new Promise<never>((_res, rej) =>
-          setTimeout(() => {
+        new Promise<never>((_res, rej) => {
+          graceTimer = setTimeout(() => {
             if (sawOffline)
               rej(
                 new Error('ESP32 proxy is offline. Check the device and its WiFi/MQTT connection.'),
               );
-          }, OFFLINE_GRACE_MS),
-        ),
+          }, OFFLINE_GRACE_MS);
+        }),
       ]),
       COMMAND_TIMEOUT_MS,
       'ESP32 proxy did not respond. Check that it is powered on and connected to MQTT.',
     );
   } finally {
+    // The race settles on the first branch; without this the timer still holds
+    // a ref'd handle for the rest of its 2 s (#404).
+    if (graceTimer) clearTimeout(graceTimer);
     client.removeListener('message', onMessage);
   }
 }
@@ -147,6 +160,9 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
 
     // Find a matching adapter
     let weightOnlyFallback: (RawReading & { address: string }) | null = null;
+    // A scale refused over GATT because it is read from its advertisements
+    // (#422): the final error must say so, not that nothing was found.
+    let refused: { address: string; name: string } | null = null;
 
     for (const entry of candidates) {
       const info = toBleDeviceInfo(entry);
@@ -154,14 +170,14 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       const adapter = resolveAdapter(info, adapters);
       if (!adapter) continue;
 
-      bleLog.info(`Matched: ${adapter.name} (${entry.name || entry.address})`);
+      bleLog.info(`Matched: ${adapter.name} (${safeName(entry.name) || entry.address})`);
 
       // Classify the advertisement with the shared decision (#242).
       const decision = evaluateAdvertisement(adapter, info);
 
       if (decision.kind === 'complete') {
         bleLog.info(`Broadcast reading: ${decision.reading.weight} kg`);
-        registerScaleMac(config, entry.address).catch(() => {});
+        registerScaleMac(config, entry.address, adapter).catch(() => {});
         return { reading: decision.reading, adapter };
       }
 
@@ -177,6 +193,9 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       // connecting. (A saved fallback means GATT must NOT be opened, matching the
       // pre-#242 `weightOnlyFallback || hasParseableBroadcastSource` guard.)
       if (weightOnlyFallback || decision.kind === 'wait') {
+        // What the scale is showing while it converges. Not a reading, so it
+        // never ends the scan (#356).
+        if (decision.kind === 'wait' && decision.live) opts.onLiveWeight?.(decision.live);
         bleLog.debug(`${adapter.name} supports broadcast, waiting for stable reading...`);
         continue;
       }
@@ -198,19 +217,52 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
         entry.addr_type ?? 0,
       );
       try {
-        const raw = await waitForRawReading(
-          charMap,
-          device,
-          adapter,
-          opts.profile,
-          entry.address.replace(/[:-]/g, '').toUpperCase(),
-          opts.weightUnit,
-          opts.onLiveData,
-          opts.scaleAuth,
+        // Re-resolve char-aware now that discovery is complete, as the watcher
+        // does (#319): before discovery Mi Scale 2 claims anything advertising
+        // the generic 0x181B service, and a standard BCS scale reaches its own
+        // adapter only here.
+        const resolved = selectSessionAdapter(
+          info,
+          { characteristicUuids: [...charMap.keys()] },
+          adapters,
+          { advertisedPick: adapter, address: entry.address },
+        )!;
+        // A scale read from its advertisements is never driven over GATT; its
+        // GATT path can answer the unlock forever without a weight (#422).
+        if (readsFromAdvertisement(resolved)) {
+          bleLog.info(
+            `Connect to ${resolved.name} (${entry.address}) ignored: this scale is read from ` +
+              'its advertisements, not over GATT. Disconnecting.',
+          );
+          // Awaited, so the config marking it passive reaches the broker
+          // before the disconnect in the finally.
+          await registerScaleMac(config, entry.address, resolved).catch(() => {});
+          refused = { address: entry.address, name: resolved.name };
+          continue;
+        }
+        // Bounded like the node-ble and noble reads. An ESP32 that drops off
+        // Wi-Fi mid-session sends no `disconnected`, so without this the read
+        // waited for as long as the caller's own deadline allowed (B-18).
+        const raw = await runGattSession(
+          {
+            charMap,
+            device,
+            adapter: resolved,
+            profile: opts.profile,
+            address: entry.address.replace(/[:-]/g, '').toUpperCase(),
+            onLiveData: opts.onLiveData,
+            scaleAuth: opts.scaleAuth,
+            deviceName: info.localName,
+            manufacturerData: info.manufacturerData,
+          },
+          nativePolicy(opts.readingTimeoutMs),
         );
-        registerScaleMac(config, entry.address).catch(() => {});
+        registerScaleMac(config, entry.address, resolved).catch(() => {});
         return raw;
       } finally {
+        // fireDisconnect() (inside the wrapper) before cleanup(), so the
+        // session's unsubscribers still have a live message listener to run
+        // through. The two watcher paths already do it in this order.
         device.cleanup();
         await mqttGattDisconnect(client, t).catch(() => {});
       }
@@ -220,8 +272,17 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       bleLog.info(
         `Broadcast reading (weight only, impedance not yet available): ${weightOnlyFallback.reading.weight} kg`,
       );
-      registerScaleMac(config, weightOnlyFallback.address).catch(() => {});
+      registerScaleMac(config, weightOnlyFallback.address, weightOnlyFallback.adapter).catch(
+        () => {},
+      );
       return { reading: weightOnlyFallback.reading, adapter: weightOnlyFallback.adapter };
+    }
+
+    if (refused) {
+      throw new Error(
+        `${refused.name} (${refused.address}) is read from its advertisements, and this scan ` +
+          'snapshot held no broadcast reading from it. Step on the scale and try again.',
+      );
     }
 
     throw new Error(
@@ -238,11 +299,6 @@ export async function scanAndReadRaw(opts: ScanOptions): Promise<RawReading> {
       /* ignore */
     }
   }
-}
-
-export async function scanAndRead(opts: ScanOptions): Promise<BodyComposition> {
-  const { reading, adapter } = await scanAndReadRaw(opts);
-  return adapter.computeMetrics(reading, opts.profile);
 }
 
 export async function scanDevices(
@@ -264,7 +320,7 @@ export async function scanDevices(
       const matched = resolveAdapter(info, adapters);
       return {
         address: entry.address,
-        name: entry.name,
+        name: safeName(entry.name),
         matchedAdapter: matched?.name,
       };
     });

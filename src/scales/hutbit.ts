@@ -9,7 +9,13 @@ import type {
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { uuid16, buildPayload, computeBiaFat } from './body-comp-helpers.js';
+import {
+  uuid16,
+  buildPayload,
+  computeBiaFat,
+  IMPEDANCE_MIN_OHM,
+  IMPEDANCE_MAX_OHM,
+} from './body-comp-helpers.js';
 import { bleLog } from '../ble/types.js';
 import { isHutbitOemAdvert, LEFU_COMPANY_ID } from './lefu-signature.js';
 import type { MatchDescriptor } from './match-descriptor.js';
@@ -62,16 +68,20 @@ const IMPEDANCE_MEASURING = 0x00;
 const IMPEDANCE_NO_CONTACT = 0xff;
 const IMPEDANCE_STATUS = 0xcb;
 
-/**
- * Accepted whole-body impedance range. Adult foot-to-foot BIA on this class of
- * scale sits between roughly 300 and 900 ohm; the wider bound here rejects a
- * mis-framed notification without second-guessing an unusual body. A rejected
- * value is logged rather than dropped in silence, so the first unit that falls
- * outside the range is diagnosable from its log instead of reading as "this
- * scale sends no impedance".
+/*
+ * The accepted whole-body impedance range is IMPEDANCE_MIN_OHM to
+ * IMPEDANCE_MAX_OHM, imported above so this adapter and the shared BIA guard
+ * cannot drift apart. This range started here, in #322, after a unit began
+ * publishing nonsense.
+ *
+ * What this adapter does with an out-of-range value is NOT what the shared
+ * guard does, and that difference is deliberate: here the impedance is dropped
+ * at parse time and never published, so a reading looks the same as one from a
+ * scale that sends no impedance at all. The shared guard publishes the number
+ * and refuses it only as a BIA input. See ADR D011. A rejected value is logged
+ * either way, so the first unit that falls outside the range is diagnosable
+ * from its log.
  */
-const IMPEDANCE_MIN_OHM = 150;
-const IMPEDANCE_MAX_OHM = 1200;
 
 /**
  * How long the link is held open after the stable weight for the impedance
@@ -95,6 +105,19 @@ const IMPEDANCE_PAIRING_WINDOW_MS = 10_000;
 /** Additive checksum over D0..STATUS (bytes 2..6), matching the vendor frames. */
 function frameChecksum(data: Buffer): number {
   return (data[2] + data[3] + data[4] + data[5] + data[6]) & 0xff;
+}
+
+/** One weigh-in's state, replaced whole at both session boundaries (#394, SCALES.md). */
+class HutbitSession {
+  final = false;
+  /**
+   * Weight from this session's stable frame, kept so the impedance frame that
+   * follows it is paired with this weigh-in's number, never the previous
+   * person's (#138).
+   */
+  lastStableWeight = 0;
+  /** When the paired weight was measured, for the pairing window. */
+  lastStableAt = 0;
 }
 
 /**
@@ -127,41 +150,48 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
   readonly match: MatchDescriptor = {
     priority: 35,
     custom: true,
-    names: { includes: ['hutbit'] },
+    names: { includes: ['hutbit', 'fittrack'] },
     serviceUuids: ['ffb0'],
     manufacturerId: LEFU_COMPANY_ID,
   };
   readonly charNotifyUuid = CHR_FFB2;
   readonly charWriteUuid = CHR_FFB1;
-  readonly normalizesWeight = true;
 
   readonly characteristics: CharacteristicBinding[] = [
     { uuid: CHR_FFB1, type: 'write' },
     { uuid: CHR_FFB2, type: 'notify' },
   ];
 
-  private final = false;
-
-  /**
-   * Weight from this session's stable frame, kept so the impedance frame that
-   * follows it can be paired with the right number.
-   *
-   * Adapters are shared singletons, so this is cleared on every session
-   * boundary. Without that, an impedance frame arriving early in one session
-   * could be paired with the previous session's weight, which on a shared scale
-   * means one person's impedance against another person's body (#138).
-   */
-  private lastStableWeight = 0;
-
-  /** When the paired weight was measured, for the pairing window above. */
-  private lastStableAt = 0;
+  private s = new HutbitSession();
 
   matches(device: BleDeviceInfo): boolean {
     // Branded units advertise "Hutbit Scale". Lefu OEM stock units advertise a
     // generic name instead (observed: "SWAN", #278), and over the ESPHome proxy
     // the local name arrives empty entirely because it lives in the scan
     // response, so the name alone is not enough.
-    if ((device.localName || '').toLowerCase().includes('hutbit')) return true;
+    const name = (device.localName || '').toLowerCase();
+    if (name.includes('hutbit')) return true;
+
+    // FitTrack Dara 2.0 (eLink/Icomon platform, Fitdays-family firmware) speaks
+    // this exact protocol: openScale's own handler documents the same 8-byte
+    // `AC 02 <b2> <b3> <b4> <b5> <chan> <cksum>` frames, the same additive
+    // checksum, the same 0xCC handshake / 0xCE live / 0xCA stable / 0xCB
+    // composition channels, and the same `FE 06 <unit>` unit command this
+    // adapter's handshake already sends.
+    //
+    // Claimed by NAME only. A unit carrying the Lefu 0x02AC signature is
+    // already claimed by `isHutbitOemAdvert` below; what this adds is the unit
+    // that advertises under its brand without it. Today such a device falls to
+    // the generic MGB FFB0 fallback, whose parser requires `length >= 10` and
+    // header `ac 02|03 ff`, so it rejects every 8-byte frame this family sends
+    // and the user gets no reading at all.
+    //
+    // The evidence is openScale's decode, not a capture of our own, so the
+    // claim is deliberately narrow and the failure mode stays safe: if the
+    // framing turns out to differ, this file's checksum and status gates
+    // reject the frames and the outcome is the same no-reading as today,
+    // never a fabricated weight.
+    if (name.includes('fittrack')) return true;
 
     // OEM/rebranded units: claim on the advertisement fingerprint instead. This
     // deliberately does NOT claim the broader nameless FFB0 space; without the
@@ -171,8 +201,11 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
     return isHutbitOemAdvert(device);
   }
 
+  onSessionStart(): void {
+    this.s = new HutbitSession();
+  }
+
   async onConnected(ctx: ConnectionContext): Promise<void> {
-    this.resetSession();
     for (const hex of HANDSHAKE) {
       // Write without response: FFB1 is the Lefu/Fitdays FFB0 handshake char and
       // the family writes no-response. A char that advertises only
@@ -210,9 +243,9 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
     const weight = data.readUInt16BE(2) / WEIGHT_DIV;
     if (!(weight > 0) || !Number.isFinite(weight)) return null;
 
-    this.final = true;
-    this.lastStableWeight = weight;
-    this.lastStableAt = Date.now();
+    this.s.final = true;
+    this.s.lastStableWeight = weight;
+    this.s.lastStableAt = Date.now();
     // Weight first, impedance second: the scale sends it after the weight has
     // settled, so this reading is complete but not final, and the handler holds
     // the link open for COMPOSITION_HOLD_MS to see whether one arrives.
@@ -246,13 +279,13 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
       );
       return null;
     }
-    if (!this.final || !(this.lastStableWeight > 0)) {
+    if (!this.s.final || !(this.s.lastStableWeight > 0)) {
       // An impedance with no weight of its own is not a reading, and pairing it
       // with whatever weight came last would be worse than dropping it.
       bleLog.debug(`Hutbit: impedance ${impedance} ohm arrived before any stable weight, ignoring`);
       return null;
     }
-    const age = Date.now() - this.lastStableAt;
+    const age = Date.now() - this.s.lastStableAt;
     if (age > IMPEDANCE_PAIRING_WINDOW_MS) {
       bleLog.debug(
         `Hutbit: impedance ${impedance} ohm arrived ${Math.round(age / 1000)}s after the ` +
@@ -262,11 +295,11 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
     }
 
     bleLog.debug(`Hutbit: impedance ${impedance} ohm (#322)`);
-    return { weight: this.lastStableWeight, impedance };
+    return { weight: this.s.lastStableWeight, impedance };
   }
 
   isComplete(reading: ScaleReading): boolean {
-    return reading.weight > 0 && this.final;
+    return reading.weight > 0 && this.s.final;
   }
 
   /**
@@ -280,13 +313,7 @@ export class HutbitAdapter implements ScaleAdapterCore, GattWiring, HoldForCompo
   }
 
   onSessionEnd(): void {
-    this.resetSession();
-  }
-
-  private resetSession(): void {
-    this.final = false;
-    this.lastStableWeight = 0;
-    this.lastStableAt = 0;
+    this.s = new HutbitSession();
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {

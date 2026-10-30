@@ -3,8 +3,7 @@ import type { BodyComposition } from '../interfaces/scale-adapter.js';
 import type { Exporter, ExportContext, ExportResult } from '../interfaces/exporter.js';
 import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { WebhookConfig } from './config.js';
-import { withRetry, httpError } from '../utils/retry.js';
-import { errMsg } from '../utils/error.js';
+import { sendWithRetry, probe } from './http.js';
 
 const log = createLogger('Webhook');
 
@@ -53,18 +52,7 @@ export class WebhookExporter implements Exporter {
   }
 
   async healthcheck(): Promise<ExportResult> {
-    try {
-      const response = await fetch(this.config.url, {
-        method: 'HEAD',
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) {
-        return { success: false, error: `HTTP ${response.status}` };
-      }
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    return probe(this.config.url, { method: 'HEAD' });
   }
 
   async export(data: BodyComposition, context?: ExportContext): Promise<ExportResult> {
@@ -73,23 +61,19 @@ export class WebhookExporter implements Exporter {
       ? { ...data, user_name: context.userName, user_slug: context.userSlug }
       : data;
 
-    return withRetry(
-      async () => {
-        const response = await fetch(url, {
-          method,
-          headers: { 'Content-Type': 'application/json', ...headers },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(timeout),
-        });
-
-        if (!response.ok) {
-          throw httpError(response.status);
-        }
-
-        log.info(`Webhook delivered (HTTP ${response.status}).`);
-        return { success: true };
+    return sendWithRetry(
+      url,
+      {
+        method,
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(payload),
       },
-      { log, label: 'webhook' },
+      {
+        log,
+        label: 'webhook',
+        timeoutMs: timeout,
+        onOk: (response) => log.info(`Webhook delivered (HTTP ${response.status}).`),
+      },
     );
   }
 }

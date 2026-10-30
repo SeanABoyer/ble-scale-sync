@@ -6,6 +6,7 @@ import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { MqttConfig } from './config.js';
 import { withRetry } from '../utils/retry.js';
 import { errMsg } from '../utils/error.js';
+import { withTimeout } from '../utils/timeout.js';
 
 const require = createRequire(import.meta.url);
 const pkg = require('../../package.json') as { version: string };
@@ -14,17 +15,51 @@ const log = createLogger('MQTT');
 
 const CONNECT_TIMEOUT_MS = 10_000;
 
+/**
+ * What the state topic carries: the body composition plus the time the
+ * weigh-in was measured (#478). The time is what tells one weigh-in from the
+ * next: a retained payload replayed after a Home Assistant restart resets every
+ * sensor's last_changed, and an identical weight does not move it at all.
+ */
+type MqttStatePayload = { timestamp: string } & BodyComposition;
+
 interface HaMetricDef {
-  key: keyof BodyComposition;
+  key: keyof MqttStatePayload;
   name: string;
   unit?: string;
   deviceClass?: string;
   icon?: string;
   precision?: number;
   entityCategory?: string;
+  /**
+   * Only some weigh-ins carry it (#497). Its config goes out only with a
+   * payload that has it, so a setup whose scale never measures it gets no
+   * entity, and its template renders 'None' (unknown in HA) for a payload
+   * without it instead of logging a template warning.
+   */
+  optional?: true;
+  /** false: HA creates the entity disabled, for the user to turn on (#497). */
+  enabledByDefault?: false;
 }
 
-const HA_METRICS: HaMetricDef[] = [
+/**
+ * A segment impedance sensor (#497): diagnostic, created disabled, and only
+ * once a payload carries the value.
+ */
+function segmentSensor<K extends keyof BodyComposition>(key: K, name: string) {
+  return {
+    key,
+    name,
+    unit: 'Ω',
+    icon: 'mdi:flash',
+    precision: 1,
+    entityCategory: 'diagnostic',
+    enabledByDefault: false,
+    optional: true,
+  } as const;
+}
+
+const HA_METRICS = [
   { key: 'weight', name: 'Weight', unit: 'kg', deviceClass: 'weight', precision: 2 },
   {
     key: 'impedance',
@@ -38,6 +73,14 @@ const HA_METRICS: HaMetricDef[] = [
   { key: 'waterPercent', name: 'Water', unit: '%', icon: 'mdi:water-percent', precision: 1 },
   { key: 'boneMass', name: 'Bone Mass', unit: 'kg', deviceClass: 'weight', precision: 1 },
   { key: 'muscleMass', name: 'Muscle Mass', unit: 'kg', deviceClass: 'weight', precision: 1 },
+  {
+    key: 'skeletalMusclePercent',
+    name: 'Skeletal Muscle',
+    unit: '%',
+    icon: 'mdi:arm-flex',
+    precision: 1,
+    optional: true,
+  },
   { key: 'visceralFat', name: 'Visceral Fat', icon: 'mdi:stomach' },
   {
     key: 'physiqueRating',
@@ -47,23 +90,40 @@ const HA_METRICS: HaMetricDef[] = [
   },
   { key: 'bmr', name: 'BMR', unit: 'kcal', icon: 'mdi:fire' },
   { key: 'metabolicAge', name: 'Metabolic Age', unit: 'yr', icon: 'mdi:calendar-clock' },
-];
+  segmentSensor('impedanceTrunk20kHz', 'Impedance Trunk 20 kHz'),
+  segmentSensor('impedanceTrunk100kHz', 'Impedance Trunk 100 kHz'),
+  segmentSensor('impedanceLeftArm20kHz', 'Impedance Left Arm 20 kHz'),
+  segmentSensor('impedanceLeftArm100kHz', 'Impedance Left Arm 100 kHz'),
+  segmentSensor('impedanceRightArm20kHz', 'Impedance Right Arm 20 kHz'),
+  segmentSensor('impedanceRightArm100kHz', 'Impedance Right Arm 100 kHz'),
+  segmentSensor('impedanceLeftLeg20kHz', 'Impedance Left Leg 20 kHz'),
+  segmentSensor('impedanceLeftLeg100kHz', 'Impedance Left Leg 100 kHz'),
+  segmentSensor('impedanceRightLeg20kHz', 'Impedance Right Leg 20 kHz'),
+  segmentSensor('impedanceRightLeg100kHz', 'Impedance Right Leg 100 kHz'),
+  // A time, not a quantity: HA allows a timestamp sensor no state_class and no
+  // unit, and the device class brings its own icon.
+  { key: 'timestamp', name: 'Last Weigh-in', deviceClass: 'timestamp' },
+  // `satisfies`, not `: HaMetricDef[]`: an annotation widens `key` to
+  // `keyof MqttStatePayload` and the completeness check below would then see
+  // every key as covered no matter what this list contains.
+] satisfies readonly HaMetricDef[];
 
-// Compile-time check: fails if a field is added to BodyComposition but not to HA_METRICS
-const _haKeysCheck: Record<keyof BodyComposition, true> = {
-  weight: true,
-  impedance: true,
-  bmi: true,
-  bodyFatPercent: true,
-  waterPercent: true,
-  boneMass: true,
-  muscleMass: true,
-  visceralFat: true,
-  physiqueRating: true,
-  bmr: true,
-  metabolicAge: true,
-};
-void _haKeysCheck;
+/**
+ * Compile-time check that every key the state topic carries (BodyComposition
+ * plus the timestamp) has an HA sensor.
+ *
+ * This used to be a SEPARATE hand-written `Record<keyof BodyComposition, true>`
+ * listing the keys again, which only ever checked itself: `HA_METRICS = []`
+ * still compiled, and adding a field to BodyComposition forced an edit to the
+ * bookkeeping record rather than to the metrics. The list above is the record
+ * now, so the two cannot drift.
+ */
+/** Reading view: the literal types above are for the completeness check only. */
+const HA_METRIC_DEFS: readonly HaMetricDef[] = HA_METRICS;
+
+type CoveredMetricKey = (typeof HA_METRICS)[number]['key'];
+const _haMetricsAreComplete: Record<Exclude<keyof MqttStatePayload, CoveredMetricKey>, never> = {};
+void _haMetricsAreComplete;
 
 export const mqttSchema: ExporterSchema = {
   name: 'mqtt',
@@ -76,7 +136,9 @@ export const mqttSchema: ExporterSchema = {
       label: 'Broker URL',
       type: 'string',
       required: true,
-      description: 'e.g., mqtts://broker.hivemq.com:8883',
+      // Not a public broker: readings are published retained on a predictable
+      // topic, so anyone subscribing there would get them.
+      description: 'Your own broker, e.g., mqtt://homeassistant.local:1883',
     },
     {
       key: 'topic',
@@ -127,8 +189,96 @@ export const mqttSchema: ExporterSchema = {
   supportsPerUser: false,
 };
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type MqttClient = { publishAsync: any; endAsync: any };
+/**
+ * Just enough of mqtt's Client to use it. Structural on purpose: `mqtt` is a
+ * dynamic import so an install with no broker configured never loads it, and a
+ * top-level type import would defeat that.
+ */
+interface MqttClient {
+  publishAsync(topic: string, payload: string, opts: Record<string, unknown>): Promise<unknown>;
+  endAsync(force?: boolean): Promise<void>;
+  end(force?: boolean): void;
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  removeListener(event: string, listener: (...args: unknown[]) => void): unknown;
+}
+
+/**
+ * Deadline for everything after the connect: discovery, the publish itself and
+ * the disconnect. Only the connect used to have one, so a publish that never
+ * settled - a broker that accepts TCP and then stops acknowledging QoS 1 - hung
+ * the export forever. `Promise.allSettled` in the orchestrator waits for every
+ * exporter to SETTLE, so the whole cycle stopped behind it and nothing asked
+ * the scale for another reading.
+ */
+const OPERATION_TIMEOUT_MS = 15_000;
+/** Closing is cleanup, not delivery; it gets a short leash and never blocks. */
+const DISCONNECT_TIMEOUT_MS = 5_000;
+
+/**
+ * Connect, owning the client from the moment it EXISTS rather than from the
+ * moment it is usable.
+ *
+ * `connectAsync` hands the client back only once it has connected, so a timeout
+ * racing that promise left the caller with no handle at all: the connection
+ * could still come up afterwards, with nobody left to close it. `connect()` is
+ * synchronous and returns the client immediately, so a failed or timed-out
+ * attempt still has something concrete to shut down.
+ */
+async function connectOwned(
+  brokerUrl: string,
+  options: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<MqttClient> {
+  const { connect } = await import('mqtt');
+  const client = connect(brokerUrl, options) as unknown as MqttClient;
+  const ready = new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      client.removeListener('connect', onConnect);
+      client.removeListener('error', onError);
+    };
+    const onConnect = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: unknown): void => {
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    client.on('connect', onConnect);
+    client.on('error', onError);
+  });
+
+  try {
+    await withTimeout(ready, timeoutMs, 'MQTT connection timed out');
+    return client;
+  } catch (err) {
+    // We created it, so we close it - including on the timeout path, which is
+    // exactly where the old code had nothing to close.
+    await endQuietly(client);
+    throw err;
+  }
+}
+
+/**
+ * Close a client without letting the close decide whether the export worked.
+ *
+ * This used to be a bare `finally { await client.endAsync(); }` inside the
+ * retry, so a disconnect that rejected replaced an already-successful publish
+ * with a failure and the retry published the same reading again. A close that
+ * fails is worth a log line and a forced teardown, never a redelivery.
+ */
+async function endQuietly(client: MqttClient): Promise<void> {
+  try {
+    await withTimeout(client.endAsync(), DISCONNECT_TIMEOUT_MS, 'MQTT disconnect timed out');
+  } catch (err) {
+    log.debug(`Closing the MQTT connection failed: ${errMsg(err)}`);
+    try {
+      client.end(true);
+    } catch {
+      /* nothing further to try */
+    }
+  }
+}
 
 export class MqttExporter implements Exporter {
   readonly name = 'mqtt';
@@ -138,7 +288,11 @@ export class MqttExporter implements Exporter {
     this.config = config;
   }
 
-  private async publishDiscovery(client: MqttClient, context?: ExportContext): Promise<void> {
+  private async publishDiscovery(
+    client: MqttClient,
+    state: MqttStatePayload,
+    context?: ExportContext,
+  ): Promise<void> {
     const slug = context?.userSlug;
     const dataTopic = slug ? `${this.config.topic}/${slug}` : this.config.topic;
     const statusTopic = `${dataTopic}/status`;
@@ -156,14 +310,23 @@ export class MqttExporter implements Exporter {
       sw_version: pkg.version,
     };
 
-    for (const metric of HA_METRICS) {
+    let published = 0;
+    for (const metric of HA_METRIC_DEFS) {
+      if (metric.optional && state[metric.key] === undefined) continue;
       const topic = `homeassistant/sensor/${deviceId}/${metric.key}/config`;
+      const value = `value_json.${metric.key}`;
       const payload: Record<string, unknown> = {
         name: metric.name,
         unique_id: `${deviceId}_${metric.key}`,
         state_topic: dataTopic,
-        value_template: `{{ value_json.${metric.key} }}`,
-        state_class: 'measurement',
+        // HA renders a missing key as '' and logs a warning for it; 'None' is
+        // its own word for unknown.
+        value_template: metric.optional
+          ? `{{ ${value} if ${value} is defined else 'None' }}`
+          : `{{ ${value} }}`,
+        // HA warns about any state_class on a timestamp sensor and keeps no
+        // statistics for one.
+        ...(metric.deviceClass === 'timestamp' ? {} : { state_class: 'measurement' }),
         availability: [{ topic: statusTopic }],
         device,
       };
@@ -172,33 +335,30 @@ export class MqttExporter implements Exporter {
       if (metric.icon) payload.icon = metric.icon;
       if (metric.precision !== undefined) payload.suggested_display_precision = metric.precision;
       if (metric.entityCategory) payload.entity_category = metric.entityCategory;
+      if (metric.enabledByDefault === false) payload.enabled_by_default = false;
 
       await client.publishAsync(topic, JSON.stringify(payload), { qos: 1, retain: true });
+      published++;
     }
 
     await client.publishAsync(statusTopic, 'online', { qos: 1, retain: true });
     const suffix = slug ? ` (user: ${slug})` : '';
-    log.info(`Published HA discovery for ${HA_METRICS.length} metrics${suffix}.`);
+    log.info(`Published HA discovery for ${published} sensors${suffix}.`);
   }
 
   async healthcheck(): Promise<ExportResult> {
     try {
-      const { connectAsync } = await import('mqtt');
-      const client = await Promise.race([
-        connectAsync(this.config.brokerUrl, {
+      const client = await connectOwned(
+        this.config.brokerUrl,
+        {
           clientId: `${this.config.clientId}-healthcheck`,
           username: this.config.username,
           password: this.config.password,
           connectTimeout: CONNECT_TIMEOUT_MS,
-        }),
-        new Promise<never>((_resolve, reject) =>
-          setTimeout(
-            () => reject(new Error('MQTT healthcheck timed out')),
-            CONNECT_TIMEOUT_MS + 2_000,
-          ),
-        ),
-      ]);
-      await client.endAsync();
+        },
+        CONNECT_TIMEOUT_MS + 2_000,
+      );
+      await endQuietly(client);
       return { success: true };
     } catch (err) {
       return { success: false, error: errMsg(err) };
@@ -206,7 +366,6 @@ export class MqttExporter implements Exporter {
   }
 
   async export(data: BodyComposition, context?: ExportContext): Promise<ExportResult> {
-    const { connectAsync } = await import('mqtt');
     const {
       brokerUrl,
       topic: baseTopic,
@@ -222,10 +381,21 @@ export class MqttExporter implements Exporter {
     const dataTopic = context?.userSlug ? `${baseTopic}/${context.userSlug}` : baseTopic;
     const statusTopic = haDiscovery ? `${dataTopic}/status` : undefined;
 
+    // The measurement time the processor decided for this reading (D027), so
+    // all three attempts below send the same value and it matches what every
+    // other exporter records. `new Date()` only covers a caller outside the
+    // processor, as in the file exporter.
+    const state: MqttStatePayload = {
+      timestamp: (context?.timestamp ?? new Date()).toISOString(),
+      ...data,
+    };
+    const payload = JSON.stringify(state);
+
     return withRetry(
       async () => {
-        const client = await Promise.race([
-          connectAsync(brokerUrl, {
+        const client = await connectOwned(
+          brokerUrl,
+          {
             clientId,
             username,
             password,
@@ -233,26 +403,30 @@ export class MqttExporter implements Exporter {
             ...(statusTopic && {
               will: { topic: statusTopic, payload: Buffer.from('offline'), qos: 1, retain: true },
             }),
-          }),
-          new Promise<never>((_resolve, reject) =>
-            setTimeout(
-              () => reject(new Error('MQTT connection timed out')),
-              CONNECT_TIMEOUT_MS + 2_000,
-            ),
-          ),
-        ]);
+          },
+          CONNECT_TIMEOUT_MS + 2_000,
+        );
 
         try {
           if (haDiscovery) {
-            await this.publishDiscovery(client, context);
+            await withTimeout(
+              this.publishDiscovery(client, state, context),
+              OPERATION_TIMEOUT_MS,
+              'MQTT discovery publish timed out',
+            );
           }
 
-          const payload = JSON.stringify(data);
-          await client.publishAsync(dataTopic, payload, { qos, retain });
+          await withTimeout(
+            client.publishAsync(dataTopic, payload, { qos, retain }),
+            OPERATION_TIMEOUT_MS,
+            'MQTT publish timed out',
+          );
           log.info(`Published to ${dataTopic} (qos=${qos}, retain=${retain}).`);
           return { success: true };
         } finally {
-          await client.endAsync();
+          // endQuietly never throws, so a failed disconnect cannot turn a
+          // delivered reading into a retry that publishes it a second time.
+          await endQuietly(client);
         }
       },
       { log, label: 'MQTT publish' },

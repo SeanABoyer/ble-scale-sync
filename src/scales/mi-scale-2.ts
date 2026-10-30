@@ -43,7 +43,6 @@ export class MiScale2Adapter implements ScaleAdapterCore, GattWiring, Unlockable
   };
   readonly charNotifyUuid = CHR_MI_HISTORY;
   readonly charWriteUuid = CHR_MI_HISTORY;
-  readonly normalizesWeight = true;
   /** ENABLE_HISTORY_MAGIC: triggers the scale to start streaming data. */
   readonly unlockCommand = [0x01, 0x96, 0x8a, 0xbd, 0x62];
   readonly unlockIntervalMs = 3000;
@@ -145,28 +144,39 @@ export class MiScale2Adapter implements ScaleAdapterCore, GattWiring, Unlockable
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const { weight, impedance } = reading;
-    const mi = new MiScaleCalc(profile.gender === 'male' ? 1 : 0, profile.age, profile.height);
-
-    const fat = mi.bodyFat(weight, impedance);
-    const water = mi.water(fat);
-    const bone = mi.boneMass(weight, impedance);
-    const muscle = mi.muscle(weight, impedance);
-    const visceralFat = mi.visceralFat(weight);
-
-    return buildPayload(
-      weight,
-      impedance,
-      {
-        fat,
-        water,
-        muscle,
-        bone,
-        visceralFat,
-      },
-      profile,
-    );
+    return computeMiScaleComposition(reading.weight, reading.impedance, profile);
   }
+}
+
+/**
+ * Body composition from weight and 50 kHz impedance with the Xiaomi formulas
+ * below. Shared by the Xiaomi scales that broadcast raw impedance: the Mi
+ * Scale 2, and the S400, whose own app lands within a couple of points of these
+ * equations while the generic BIA coefficients are off by five or more.
+ *
+ * Impedance 0 (a weigh-in in socks, or a value the processor refused) gets the
+ * BMI estimate, never the Xiaomi equations (ADR D028, review D-05). With 0 the
+ * impedance term of the lean-mass coefficient simply drops out, which is
+ * neither a measurement nor the estimate: 25.55 % fat and a visceral rating of
+ * 1 for a 165 cm, 40-year-old, 60 kg woman whose estimate is 30.25 %. The
+ * broadcast path does export weight-only Mi Scale 2 frames once
+ * `IMPEDANCE_GRACE_MS` runs out, so this is a real path, not a corner case.
+ */
+export function computeMiScaleComposition(
+  weight: number,
+  impedance: number,
+  profile: UserProfile,
+): BodyComposition {
+  if (!(impedance > 0)) return buildPayload(weight, impedance, {}, profile);
+
+  const mi = new MiScaleCalc(profile.gender === 'male' ? 1 : 0, profile.age, profile.height);
+
+  const fat = mi.bodyFat(weight, impedance);
+  const water = mi.water(fat);
+  const bone = mi.boneMass(weight, impedance);
+  const visceralFat = mi.visceralFat(weight);
+
+  return buildPayload(weight, impedance, { fat, water, bone, visceralFat }, profile);
 }
 
 // ─── MiScaleLib (ported from openScale / prototux MIBCS reverse-engineering) ─
@@ -230,28 +240,6 @@ class MiScaleCalc {
     else if (this.sex === 1 && bone > 5.2) bone = 8;
 
     return bone;
-  }
-
-  /**
-   * Skeletal-muscle percentage via Janssen et al. BIA equation.
-   * Falls back to LBM ratio if impedance is non-positive.
-   */
-  muscle(weight: number, impedance: number): number {
-    if (weight <= 0) return 0;
-
-    let smmKg: number;
-    if (impedance > 0) {
-      const h2r = (this.height * this.height) / impedance;
-      smmKg = 0.401 * h2r + 3.825 * this.sex - 0.071 * this.age + 5.102;
-    } else {
-      const bf = this.bodyFat(weight, impedance);
-      const lbm = weight - (bf / 100) * weight - this.boneMass(weight, impedance);
-      const ratio = this.sex === 1 ? 0.52 : 0.46;
-      smmKg = lbm * ratio;
-    }
-
-    const pct = (smmKg / weight) * 100;
-    return Math.max(10, Math.min(pct, 60));
   }
 
   visceralFat(weight: number): number {

@@ -1,12 +1,50 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EXPORTER_SCHEMAS } from '../../src/exporters/registry.js';
 import type { ConfigFieldDef } from '../../src/interfaces/exporter-schema.js';
 import { promptField, exportersStep } from '../../src/wizard/steps/exporters.js';
-import { createMockPromptProvider } from '../../src/wizard/prompt-provider.js';
 import type { WizardContext } from '../../src/wizard/types.js';
+import { scriptedPrompts, type ScriptedAnswer } from '../helpers/scripted-prompts.js';
+import { snapshotEnv } from '../helpers/env-snapshot.js';
+import type { UserConfig } from '../../src/config/schema.js';
 
-function makeCtx(answers: (string | number | boolean | string[])[]): WizardContext {
-  return {
+/** The exporter step reads only name, slug and exporters; the rest is filler. */
+const testUser = (name: string, slug: string): UserConfig => ({
+  name,
+  slug,
+  height: 170,
+  birth_date: '1990-01-01',
+  gender: 'female',
+  is_athlete: false,
+  weight_range: { min: 50, max: 100 },
+  last_known_weight: null,
+});
+
+const EXPORTERS = /^Exporters:/;
+const STORE_ENV = /Store it in \.env/;
+
+const scripts: ReturnType<typeof scriptedPrompts>[] = [];
+
+// A secret accepted for .env is also set in process.env (GARMIN_PASSWORD*,
+// STRAVA_CLIENT_SECRET* from the Enter-only runs below).
+let restoreEnv: () => void;
+beforeEach(() => {
+  restoreEnv = snapshotEnv();
+});
+// Every scripted answer must have been asked for and accepted. A regex that
+// matches no prompt would otherwise leave that prompt on its default, and the
+// test would pass on a path it never meant to take.
+afterEach(() => {
+  restoreEnv();
+  for (const s of scripts.splice(0)) {
+    expect(s.pending.map(([re]) => String(re))).toEqual([]);
+    expect(s.rejected).toEqual([]);
+  }
+});
+
+function makeCtx(answers: Array<[RegExp, ScriptedAnswer]> = []) {
+  const scripted = scriptedPrompts(answers);
+  scripts.push(scripted);
+  const ctx: WizardContext = {
     config: {},
     configPath: 'config.yaml',
     isEditMode: false,
@@ -18,9 +56,9 @@ function makeCtx(answers: (string | number | boolean | string[])[]): WizardConte
       hasPython: true,
       pythonCommand: 'python3',
     },
-    stepHistory: [],
-    prompts: createMockPromptProvider(answers),
+    prompts: scripted.prompts,
   };
+  return { ctx, asked: scripted.asked };
 }
 
 // ─── Schema-driven field types ───────────────────────────────────────────
@@ -28,7 +66,7 @@ function makeCtx(answers: (string | number | boolean | string[])[]): WizardConte
 describe('promptField()', () => {
   it('handles string field', async () => {
     const field: ConfigFieldDef = { key: 'url', label: 'URL', type: 'string', required: true };
-    const ctx = makeCtx(['https://example.com']);
+    const { ctx } = makeCtx([[/^URL:/, 'https://example.com']]);
     const result = await promptField(ctx, field);
     expect(result).toBe('https://example.com');
   });
@@ -41,7 +79,8 @@ describe('promptField()', () => {
       required: false,
       default: 'my-topic',
     };
-    const ctx = makeCtx(['my-topic']);
+    // Enter: the offered default is the answer.
+    const { ctx } = makeCtx();
     const result = await promptField(ctx, field);
     expect(result).toBe('my-topic');
   });
@@ -53,7 +92,10 @@ describe('promptField()', () => {
       type: 'password',
       required: true,
     };
-    const ctx = makeCtx(['secret123']);
+    const { ctx } = makeCtx([
+      [/^Password:/, 'secret123'],
+      [STORE_ENV, false], // keep it in config.yaml
+    ]);
     const result = await promptField(ctx, field);
     expect(result).toBe('secret123');
   });
@@ -65,25 +107,12 @@ describe('promptField()', () => {
       type: 'password',
       required: true,
     };
-    const mockProvider = createMockPromptProvider(['secret123']);
-    const passwordSpy = vi.spyOn(mockProvider, 'password');
-    const inputSpy = vi.spyOn(mockProvider, 'input');
-
-    const ctx: WizardContext = {
-      config: {},
-      configPath: 'config.yaml',
-      isEditMode: false,
-      nonInteractive: false,
-      platform: {
-        os: 'linux',
-        arch: 'x64',
-        hasDocker: false,
-        hasPython: true,
-        pythonCommand: 'python3',
-      },
-      stepHistory: [],
-      prompts: mockProvider,
-    };
+    const { ctx } = makeCtx([
+      [/^Password:/, 'secret123'],
+      [STORE_ENV, false],
+    ]);
+    const passwordSpy = vi.spyOn(ctx.prompts, 'password');
+    const inputSpy = vi.spyOn(ctx.prompts, 'input');
 
     await promptField(ctx, field);
     expect(passwordSpy).toHaveBeenCalledOnce();
@@ -98,7 +127,7 @@ describe('promptField()', () => {
       required: false,
       default: 10000,
     };
-    const ctx = makeCtx(['5000']);
+    const { ctx } = makeCtx([[/^Timeout:/, '5000']]);
     const result = await promptField(ctx, field);
     expect(result).toBe(5000);
   });
@@ -111,9 +140,22 @@ describe('promptField()', () => {
       required: false,
       default: true,
     };
-    const ctx = makeCtx([true]);
+    const { ctx } = makeCtx([[/^Retain\?/, true]]);
     const result = await promptField(ctx, field);
     expect(result).toBe(true);
+  });
+
+  it('returns the answer, not the default, for a boolean field', async () => {
+    const field: ConfigFieldDef = {
+      key: 'retain',
+      label: 'Retain',
+      type: 'boolean',
+      required: false,
+      default: true,
+    };
+    const { ctx } = makeCtx([[/^Retain\?/, false]]);
+    const result = await promptField(ctx, field);
+    expect(result).toBe(false);
   });
 
   it('handles select field', async () => {
@@ -128,7 +170,7 @@ describe('promptField()', () => {
         { label: 'PUT', value: 'PUT' },
       ],
     };
-    const ctx = makeCtx(['PUT']);
+    const { ctx } = makeCtx([[/^Method:/, 'PUT']]);
     const result = await promptField(ctx, field);
     expect(result).toBe('PUT');
   });
@@ -140,7 +182,7 @@ describe('promptField()', () => {
       type: 'string',
       required: false,
     };
-    const ctx = makeCtx(['']);
+    const { ctx } = makeCtx([[/^Headers:/, '']]);
     const result = await promptField(ctx, field);
     expect(result).toBeUndefined();
   });
@@ -153,7 +195,7 @@ describe('promptField()', () => {
       required: false,
       default: 1,
     };
-    const ctx = makeCtx(['']);
+    const { ctx } = makeCtx([[/^QoS:/, '']]);
     const result = await promptField(ctx, field);
     expect(result).toBe(1);
   });
@@ -163,12 +205,11 @@ describe('promptField()', () => {
 
 describe('exportersStep — confirm skip', () => {
   it('skips exporter config when user declines confirm', async () => {
-    // Unified flow: checkbox → confirm(no)
-    const ctx = makeCtx([
-      ['webhook'], // unified checkbox: select webhook (supportsGlobal)
-      false, // confirm: "Configure Webhook?" → No
+    const { ctx } = makeCtx([
+      [EXPORTERS, ['webhook']], // webhook supports global
+      [/^Configure Webhook\?/, false],
     ]);
-    ctx.config.users = [{ name: 'Test', slug: 'test' }];
+    ctx.config.users = [testUser('Test', 'test')];
 
     await exportersStep.run(ctx);
 
@@ -177,42 +218,28 @@ describe('exportersStep — confirm skip', () => {
   });
 
   it('configures exporter when user accepts confirm', async () => {
-    const webhookSchema = EXPORTER_SCHEMAS.find((s) => s.name === 'webhook')!;
-
-    // Build answers: unified checkbox → confirm → field values
-    const answers: (string | number | boolean | string[])[] = [
-      ['webhook'], // unified checkbox: select webhook
-      true, // confirm: "Configure Webhook?" → Yes
-    ];
-    // Provide a default-ish answer for each field
-    for (const field of webhookSchema.fields) {
-      if (field.type === 'string' || field.type === 'password') {
-        answers.push(field.default !== undefined ? String(field.default) : 'https://example.com');
-      } else if (field.type === 'number') {
-        answers.push(field.default !== undefined ? String(field.default) : '10000');
-      } else if (field.type === 'boolean') {
-        answers.push((field.default as boolean) ?? false);
-      } else if (field.type === 'select') {
-        answers.push(field.choices?.[0]?.value ?? 'POST');
-      }
-    }
-
-    const ctx = makeCtx(answers);
-    ctx.config.users = [{ name: 'Test', slug: 'test' }];
+    // Only the required URL is typed; every other webhook field is Enter.
+    const { ctx } = makeCtx([
+      [EXPORTERS, ['webhook']],
+      [/^Configure Webhook\?/, true],
+      [/^Webhook URL:/, 'https://example.com'],
+    ]);
+    ctx.config.users = [testUser('Test', 'test')];
 
     await exportersStep.run(ctx);
 
     expect(ctx.config.global_exporters).toBeDefined();
     expect(ctx.config.global_exporters!.length).toBe(1);
     expect(ctx.config.global_exporters![0].type).toBe('webhook');
+    expect(ctx.config.global_exporters![0]).toMatchObject({ url: 'https://example.com' });
   });
 
   it('returns early when user confirms proceeding with no exporters', async () => {
-    const ctx = makeCtx([
-      [], // unified checkbox: select nothing
-      true, // confirm: "Continue without exporters?" → Yes
+    const { ctx } = makeCtx([
+      [EXPORTERS, []],
+      [/Continue without exporters\?/, true],
     ]);
-    ctx.config.users = [{ name: 'Test', slug: 'test' }];
+    ctx.config.users = [testUser('Test', 'test')];
 
     await exportersStep.run(ctx);
 
@@ -220,31 +247,22 @@ describe('exportersStep — confirm skip', () => {
   });
 
   it('re-prompts when user declines empty selection, accepts on second try', async () => {
-    const webhookSchema = EXPORTER_SCHEMAS.find((s) => s.name === 'webhook')!;
-
-    const answers: (string | number | boolean | string[])[] = [
-      [], // first checkbox: empty
-      false, // confirm: "Continue without exporters?" → No
-      ['webhook'], // second checkbox: webhook
-      true, // confirm: "Configure Webhook?" → Yes
-    ];
-    for (const field of webhookSchema.fields) {
-      if (field.type === 'string' || field.type === 'password') {
-        answers.push(field.default !== undefined ? String(field.default) : 'https://example.com');
-      } else if (field.type === 'number') {
-        answers.push(field.default !== undefined ? String(field.default) : '10000');
-      } else if (field.type === 'boolean') {
-        answers.push((field.default as boolean) ?? false);
-      } else if (field.type === 'select') {
-        answers.push(field.choices?.[0]?.value ?? 'POST');
-      }
-    }
-
-    const ctx = makeCtx(answers);
-    ctx.config.users = [{ name: 'Test', slug: 'test' }];
+    const { ctx, asked } = makeCtx([
+      [EXPORTERS, []], // first checkbox: empty
+      [/Continue without exporters\?/, false],
+      [EXPORTERS, ['webhook']], // second checkbox
+      [/^Configure Webhook\?/, true],
+      [/^Webhook URL:/, 'https://example.com'],
+    ]);
+    ctx.config.users = [testUser('Test', 'test')];
 
     await exportersStep.run(ctx);
 
+    expect(asked.filter((m) => EXPORTERS.test(m) || /Continue without/.test(m))).toEqual([
+      expect.stringMatching(EXPORTERS),
+      expect.stringMatching(/Continue without exporters\?/),
+      expect.stringMatching(EXPORTERS),
+    ]);
     expect(ctx.config.global_exporters).toBeDefined();
     expect(ctx.config.global_exporters!.length).toBe(1);
     expect(ctx.config.global_exporters![0].type).toBe('webhook');
@@ -303,5 +321,51 @@ describe('EXPORTER_SCHEMAS filtering', () => {
         }
       }
     }
+  });
+});
+
+// ─── Per-user token directories ─────────────────────────────────────────
+
+describe('exportersStep — token_dir default per user', () => {
+  // Every user used to be offered the same './garmin-tokens'. Pressing Enter
+  // twice put two Garmin accounts in one token directory, and the second auth
+  // overwrote the first: both people's weigh-ins went to the second account.
+  // Only the required fields are typed, once per user; everything else,
+  // the token directory included, is the user pressing Enter.
+  const REQUIRED: Record<string, Array<[RegExp, ScriptedAnswer]>> = {
+    garmin: [
+      [/^Garmin Email:/, 'someone@example.com'],
+      [/^Garmin Password/, 'pw'],
+    ],
+    strava: [
+      [/^Client ID:/, '12345'],
+      [/^Client Secret/, 'pw'],
+    ],
+  };
+  function enterOnlyCtx(type: string, userCount: number): WizardContext {
+    const perUser = Array.from({ length: userCount }, () => REQUIRED[type]).flat();
+    return makeCtx([[EXPORTERS, [type]], ...perUser]).ctx;
+  }
+
+  it.each(['garmin', 'strava'])('offers each %s user a separate token_dir', async (type) => {
+    const ctx = enterOnlyCtx(type, 2);
+    ctx.config.users = [testUser('Alice', 'alice'), testUser('Bob', 'bob')];
+
+    await exportersStep.run(ctx);
+
+    const dirs = (ctx.config.users ?? []).map(
+      (u) => (u as { exporters?: { token_dir?: string }[] }).exporters?.[0]?.token_dir,
+    );
+    expect(dirs).toEqual([`./${type}-tokens/alice`, `./${type}-tokens/bob`]);
+  });
+
+  it('keeps the plain default for a single user', async () => {
+    const ctx = enterOnlyCtx('garmin', 1);
+    ctx.config.users = [testUser('Alice', 'alice')];
+
+    await exportersStep.run(ctx);
+
+    const user = ctx.config.users![0] as { exporters?: { token_dir?: string }[] };
+    expect(user.exporters?.[0]?.token_dir).toBe('./garmin-tokens');
   });
 });

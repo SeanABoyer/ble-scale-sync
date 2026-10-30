@@ -1,0 +1,14 @@
+{
+  // The whole test tree, not only the type-contract tests (`*.test-d.ts`).
+  //
+  // `tsc --noEmit` covers `src` alone, and Vitest only strips types, so a test
+  // that reads a renamed contract member gets `undefined` and can stay green.
+  // vitest.config.ts runs tsc with this file on every `npm test` and fails the
+  // run on any error here, the ordinary test files included.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src", "tests"]
+}

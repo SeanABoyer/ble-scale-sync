@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { evaluateAdvertisement, GraceTimers, DedupWindow } from '../../src/ble/advertisement.js';
+import {
+  evaluateAdvertisement,
+  GraceTimers,
+  DedupWindow,
+  ManufacturerDataCache,
+  readsFromAdvertisement,
+} from '../../src/ble/advertisement.js';
+import { MiScale2Adapter } from '../../src/scales/mi-scale-2.js';
+import { QnScaleAdapter } from '../../src/scales/qn-scale/index.js';
+import { applyForcedAdapter } from '../../src/scales/force.js';
 import type { RawReading } from '../../src/ble/shared.js';
 import type {
   ScaleAdapter,
@@ -148,6 +157,30 @@ const sharedAdapter = baseAdapter({});
 const raw = (weight: number): RawReading =>
   ({ reading: { weight, impedance: 0 }, adapter: sharedAdapter }) as RawReading;
 
+describe('readsFromAdvertisement (#422)', () => {
+  it('is true for the real Mi Scale 2, which also carries GATT wiring', () => {
+    const mi = new MiScale2Adapter();
+    expect(mi.charNotifyUuid).toBeTruthy();
+    expect(readsFromAdvertisement(mi)).toBe(true);
+  });
+
+  it('is true for a forced Mi Scale 2 (ble.force_scale_adapter)', () => {
+    const [forced] = applyForcedAdapter([new MiScale2Adapter()], 'Xiaomi Mi Scale 2');
+    expect(readsFromAdvertisement(forced)).toBe(true);
+  });
+
+  it('is false for the dual-mode QN adapter, which parses broadcasts but prefers GATT', () => {
+    const qn = new QnScaleAdapter();
+    expect(typeof qn.parseBroadcast).toBe('function');
+    expect(readsFromAdvertisement(qn)).toBe(false);
+  });
+
+  it('is false for preferPassive without any advertisement parser', () => {
+    const odd = baseAdapter({ preferPassive: true } as Partial<ScaleAdapter>);
+    expect(readsFromAdvertisement(odd)).toBe(false);
+  });
+});
+
 describe('GraceTimers', () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
@@ -173,6 +206,18 @@ describe('GraceTimers', () => {
     vi.advanceTimersByTime(200); // 1000 total since first hold
     expect(onElapsed).toHaveBeenCalledTimes(1);
     expect(onElapsed).toHaveBeenCalledWith('AA', raw(71));
+  });
+
+  it('isHolding is true only while a reading waits out its grace (#357)', () => {
+    const g = new GraceTimers(1000, vi.fn());
+    expect(g.isHolding()).toBe(false);
+    g.hold('AA', raw(70));
+    expect(g.isHolding()).toBe(true);
+    g.cancel('AA');
+    expect(g.isHolding()).toBe(false);
+    g.hold('BB', raw(80));
+    vi.advanceTimersByTime(1000);
+    expect(g.isHolding()).toBe(false);
   });
 
   it('cancel stops a pending timer and drops the stored reading', () => {
@@ -261,5 +306,52 @@ describe('DedupWindow', () => {
     const d = new DedupWindow(30_000);
     expect(d.shouldEmit('AA', 70.0)).toBe(true);
     expect(d.shouldEmit('AA', 70.0)).toBe(false);
+  });
+
+  it('keys a stored record by its own time, apart from live readings of the same weight', () => {
+    const t = 1000;
+    const d = new DedupWindow(30_000, () => t);
+    const at = '2026-10-07T19:57:25.000Z';
+    expect(d.shouldEmit('AA', 76.55, at)).toBe(true);
+    // A live weigh-in in the same 0.1 kg bucket is not that record.
+    expect(d.shouldEmit('AA', 76.52)).toBe(true);
+    // The same record handed over again still is a repeat.
+    expect(d.shouldEmit('AA', 76.55, at)).toBe(false);
+    expect(d.shouldEmit('AA', 76.55, '2026-10-07T18:00:00.000Z')).toBe(true);
+  });
+});
+
+// Shared by the ESPHome proxy and node-ble for the GATT session handoff only
+// (#461, #463, D071).
+describe('ManufacturerDataCache', () => {
+  const md = (b: number) => ({ id: 0xffff, data: Buffer.from([b]) });
+  const empty = { id: 0xffff, data: Buffer.alloc(0) };
+
+  it("gives the frame's own data first, else the last one remembered for the address", () => {
+    const c = new ManufacturerDataCache();
+    c.remember({ manufacturerData: md(1) }, 'a');
+    expect(c.forSession({ manufacturerData: md(2) }, 'a')).toEqual(md(2));
+    expect(c.forSession({}, 'a')).toEqual(md(1));
+    expect(c.forSession({}, 'b')).toBeUndefined();
+  });
+
+  it('neither remembers nor prefers an entry without bytes', () => {
+    const c = new ManufacturerDataCache();
+    c.remember({ manufacturerData: md(1) }, 'a');
+    c.remember({ manufacturerData: empty }, 'a');
+    expect(c.forSession({ manufacturerData: empty }, 'a')).toEqual(md(1));
+    // With nothing remembered there is none to hand over, not an empty one.
+    expect(c.forSession({ manufacturerData: empty }, 'b')).toBeUndefined();
+  });
+
+  it('keeps the newest addresses up to its bound', () => {
+    const c = new ManufacturerDataCache(2);
+    c.remember({ manufacturerData: md(1) }, 'a');
+    c.remember({ manufacturerData: md(2) }, 'b');
+    c.remember({ manufacturerData: md(3) }, 'a');
+    c.remember({ manufacturerData: md(4) }, 'c');
+    expect(c.forSession({}, 'b')).toBeUndefined();
+    expect(c.forSession({}, 'a')).toEqual(md(3));
+    expect(c.forSession({}, 'c')).toEqual(md(4));
   });
 });

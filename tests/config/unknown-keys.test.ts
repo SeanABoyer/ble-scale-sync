@@ -39,15 +39,65 @@ describe('collectUnknownKeys', () => {
         force_scale_adapter: 'Hutbit',
         qn_protocol_byte: 255,
         qn_report_byte: 252,
+        qn_weight_ack: true,
+        qn_user_key: 1000,
+        qn_user_slot: 2,
+        qn_a4_prelude: true,
+        qn_time_sync_long: true,
+        qn_config_long: true,
+        qn_result_ack: true,
+        rmsc04_profile_byte: '9e',
+        auto_clear_stale_bond: true,
+        preemptive_adapter_reset: false,
+        adapter_privacy: true,
+        pairing_retry_max_min: 15,
+        proxy_liveness_timeout_min: 45,
+        // One handler at a time; every section run.sh can write is here, with
+        // every key it writes into it.
+        handler: 'esphome-proxy',
+        esphome_proxy: { host: '192.168.1.50', port: 6053, encryption_key: 'k' },
+        mqtt_proxy: {
+          broker_url: 'mqtt://core-mosquitto:1883',
+          username: 'addons',
+          password: 'p',
+          embedded_broker_port: 1883,
+          device_id: 'esp32-ble-proxy',
+          topic_prefix: 'ble-proxy',
+        },
+        ha_bluetooth: { url: 'ws://supervisor/core/websocket', token: '${SUPERVISOR_TOKEN}' },
       },
-      scale: { weight_unit: 'kg', height_unit: 'cm' },
+      scale: { weight_unit: 'kg', height_unit: 'cm', display_unit: 'weight_unit' },
       unknown_user: 'nearest',
-      users: [{ ...USER, exporters: [{ type: 'mqtt', broker_url: 'mqtt://h:1883' }] }],
+      out_of_range: 'skip',
+      users: [
+        {
+          ...USER,
+          estimate_body_composition: false,
+          exporters: [{ type: 'mqtt', broker_url: 'mqtt://h:1883' }],
+        },
+      ],
       global_exporters: [{ type: 'mqtt', broker_url: 'mqtt://h:1883', qos: 0, retain: true }],
-      runtime: { continuous_mode: true, scan_cooldown: 30, dry_run: false, debug: false },
+      runtime: {
+        continuous_mode: true,
+        scan_cooldown: 30,
+        idle_rescan_delay: 5,
+        no_reading_rescan_delay: 0,
+        retry_failed_exports: true,
+        dry_run: false,
+        debug: false,
+      },
       update_check: true,
     };
     expect(collectUnknownKeys(generated)).toEqual([]);
+  });
+
+  it('knows runtime.no_reading_rescan_delay (#475)', () => {
+    expect(
+      collectUnknownKeys({
+        ...BASE,
+        runtime: { continuous_mode: true, no_reading_rescan_delay: 900 },
+      }),
+    ).toEqual([]);
   });
 
   it('reports a misspelled key under ble', () => {
@@ -82,6 +132,11 @@ describe('collectUnknownKeys', () => {
   it('reports an unknown key under ble.esphome_proxy', () => {
     const cfg = { ...BASE, ble: { esphome_proxy: { host: '10.0.0.5', encryption_ky: 'x' } } };
     expect(collectUnknownKeys(cfg)).toEqual(['ble.esphome_proxy.encryption_ky']);
+  });
+
+  it('reports an unknown key under ble.ha_bluetooth', () => {
+    const cfg = { ...BASE, ble: { ha_bluetooth: { url: 'http://h:8123', token: 't', tokn: 'x' } } };
+    expect(collectUnknownKeys(cfg)).toEqual(['ble.ha_bluetooth.tokn']);
   });
 
   it('reports an unknown key inside additional_proxies by index', () => {
@@ -127,6 +182,7 @@ describe('collectUnknownKeys', () => {
         force_scale_adapter: 'Hutbit',
         mqtt_proxy: { broker_url: 'mqtt://h:1883' },
         esphome_proxy: { host: 'h' },
+        ha_bluetooth: { url: 'http://h:8123', token: 't', source: 'aa' },
       },
     };
     expect(collectUnknownKeys(cfg)).toEqual([]);

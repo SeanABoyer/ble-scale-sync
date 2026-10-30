@@ -1,21 +1,9 @@
 import { createLogger } from '../logger.js';
+import { describeInvalidHeader, parseHeaderString } from './headers.js';
 
 const log = createLogger('ExporterConfig');
 
-export type ExporterName =
-  | 'garmin'
-  | 'mqtt'
-  | 'webhook'
-  | 'influxdb'
-  | 'ntfy'
-  | 'file'
-  | 'strava'
-  | 'telegram'
-  | 'intervals'
-  | 'runalyze'
-  | 'wger';
-
-const KNOWN_EXPORTERS = new Set<ExporterName>([
+const EXPORTER_NAMES = [
   'garmin',
   'mqtt',
   'webhook',
@@ -27,7 +15,31 @@ const KNOWN_EXPORTERS = new Set<ExporterName>([
   'intervals',
   'runalyze',
   'wger',
-]);
+  'healthlog',
+  'dreeve',
+] as const;
+
+export type ExporterName = (typeof EXPORTER_NAMES)[number];
+
+/**
+ * Runtime twin of `ExporterName`, for validating `EXPORTERS=...`.
+ *
+ * Hand-maintained, and `tests/exporters/registry.test.ts` asserts it equals the
+ * set derived from the registry. Without that assertion a twelfth exporter
+ * added per the documented steps but missed here passes lint, typecheck and
+ * the whole suite, then rejects its own name at startup (#406).
+ */
+const KNOWN_EXPORTERS = new Set<ExporterName>(EXPORTER_NAMES);
+
+/** @internal Exported for the registry-agreement test only. */
+export const _knownExporterNamesForTest: ReadonlySet<ExporterName> = KNOWN_EXPORTERS;
+
+export interface GarminConfig {
+  /** Upload the weight alone, leaving every derived metric unset in Garmin. */
+  weightOnly: boolean;
+  /** Seconds one upload attempt may take before it is killed (10-900). */
+  uploadTimeoutSec?: number;
+}
 
 export interface MqttConfig {
   brokerUrl: string;
@@ -51,7 +63,9 @@ export interface WebhookConfig {
 export interface InfluxDbConfig {
   url: string;
   token: string;
-  org: string;
+  /** v2 only. InfluxDB v3 has no organizations and ignores the parameter. */
+  org?: string;
+  /** Bucket name on v2, database name on v3. */
   bucket: string;
   measurement: string;
 }
@@ -102,8 +116,35 @@ export interface WgerConfig {
   syncMeasurements: boolean;
 }
 
+export interface HealthLogConfig {
+  baseUrl: string;
+  token: string;
+  /** Also push body-composition metrics, not just weight. */
+  syncMeasurements: boolean;
+}
+
+export type DreeveUnitSystem = 'metric' | 'imperial';
+
+export interface DreeveConfig {
+  baseUrl: string;
+  token: string;
+  unitSystem: DreeveUnitSystem;
+}
+
+/**
+ * Dreeve's Appearance unit system, read the same way from config.yaml and
+ * from DREEVE_UNIT_SYSTEM. Case is ignored on both paths, so `Metric` works in
+ * config.yaml as it does in .env, where every value is lowercased; the two
+ * values cannot be confused.
+ */
+export function parseDreeveUnitSystem(raw: string): DreeveUnitSystem | undefined {
+  const value = raw.trim().toLowerCase();
+  return value === 'metric' || value === 'imperial' ? value : undefined;
+}
+
 export interface ExporterConfig {
   exporters: ExporterName[];
+  garmin?: GarminConfig;
   mqtt?: MqttConfig;
   webhook?: WebhookConfig;
   influxdb?: InfluxDbConfig;
@@ -114,6 +155,8 @@ export interface ExporterConfig {
   intervals?: IntervalsConfig;
   runalyze?: RunalyzeConfig;
   wger?: WgerConfig;
+  healthlog?: HealthLogConfig;
+  dreeve?: DreeveConfig;
 }
 
 function fail(msg: string): never {
@@ -128,17 +171,12 @@ function parseQos(raw: string | undefined): 0 | 1 | 2 {
 }
 
 function parseHeaders(raw: string | undefined): Record<string, string> {
-  if (!raw) return {};
-  const headers: Record<string, string> = {};
-  for (const pair of raw.split(',')) {
-    const idx = pair.indexOf(':');
-    if (idx < 1) {
-      log.warn(`Ignoring invalid header (missing ':'): '${pair.trim()}'`);
-      continue;
-    }
-    const key = pair.slice(0, idx).trim();
-    const value = pair.slice(idx + 1).trim();
-    if (key) headers[key] = value;
+  // Shared with the config.yaml path in registry.ts. This parser was correct
+  // and the yaml path was not, so the rule lives in one place now rather than
+  // being reimplemented a third time.
+  const { headers, invalid } = parseHeaderString(raw ?? '');
+  for (const pair of invalid) {
+    log.warn(`Ignoring invalid header (missing ':'): ${describeInvalidHeader(pair)}`);
   }
   return headers;
 }
@@ -150,12 +188,30 @@ function parsePriority(raw: string | undefined): number {
   fail(`NTFY_PRIORITY must be 1-5, got '${raw}'`);
 }
 
+function parseUploadTimeout(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const num = Number(raw);
+  if (Number.isInteger(num) && num >= 10 && num <= 900) return num;
+  fail(`GARMIN_UPLOAD_TIMEOUT_SEC must be a whole number of seconds, 10-900, got '${raw}'`);
+}
+
+function parseWebhookTimeout(raw: string | undefined): number {
+  if (!raw) return 10_000;
+  const num = Number(raw);
+  // Same bound as the config.yaml path (`optionalNumber` in the registry).
+  // `Number(raw) || 10_000` turned a typo into the default without a word.
+  if (Number.isInteger(num) && num >= 1) return num;
+  fail(`WEBHOOK_TIMEOUT must be a whole number of milliseconds, got '${raw}'`);
+}
+
+// The same words `optionalBool` in the registry and `boolEnv` accept, so a
+// value that works in config.yaml or as an override works here too.
 function parseBoolean(key: string, raw: string | undefined, defaultValue: boolean): boolean {
   if (!raw) return defaultValue;
   const lower = raw.toLowerCase();
-  if (['true', 'yes', '1'].includes(lower)) return true;
-  if (['false', 'no', '0'].includes(lower)) return false;
-  fail(`${key} must be true/false/yes/no/1/0, got '${raw}'`);
+  if (['true', 'yes', '1', 'on'].includes(lower)) return true;
+  if (['false', 'no', '0', 'off'].includes(lower)) return false;
+  fail(`${key} must be true/false/yes/no/on/off/1/0, got '${raw}'`);
 }
 
 export function loadExporterConfig(): ExporterConfig {
@@ -174,6 +230,14 @@ export function loadExporterConfig(): ExporterConfig {
 
   if (exporters.length === 0) {
     fail('EXPORTERS must contain at least one exporter.');
+  }
+
+  let garmin: GarminConfig | undefined;
+  if (exporters.includes('garmin')) {
+    garmin = {
+      weightOnly: parseBoolean('GARMIN_WEIGHT_ONLY', process.env.GARMIN_WEIGHT_ONLY?.trim(), false),
+      uploadTimeoutSec: parseUploadTimeout(process.env.GARMIN_UPLOAD_TIMEOUT_SEC?.trim()),
+    };
   }
 
   let mqtt: MqttConfig | undefined;
@@ -205,7 +269,7 @@ export function loadExporterConfig(): ExporterConfig {
       url,
       method: process.env.WEBHOOK_METHOD?.trim()?.toUpperCase() || 'POST',
       headers: parseHeaders(process.env.WEBHOOK_HEADERS?.trim()),
-      timeout: Number(process.env.WEBHOOK_TIMEOUT?.trim()) || 10_000,
+      timeout: parseWebhookTimeout(process.env.WEBHOOK_TIMEOUT?.trim()),
     };
   }
 
@@ -219,10 +283,8 @@ export function loadExporterConfig(): ExporterConfig {
     if (!token) {
       fail('INFLUXDB_TOKEN is required when influxdb exporter is enabled.');
     }
-    const org = process.env.INFLUXDB_ORG?.trim();
-    if (!org) {
-      fail('INFLUXDB_ORG is required when influxdb exporter is enabled.');
-    }
+    // Optional, as in config.yaml: InfluxDB v3 has no organizations.
+    const org = process.env.INFLUXDB_ORG?.trim() || undefined;
     const bucket = process.env.INFLUXDB_BUCKET?.trim();
     if (!bucket) {
       fail('INFLUXDB_BUCKET is required when influxdb exporter is enabled.');
@@ -360,8 +422,50 @@ export function loadExporterConfig(): ExporterConfig {
     };
   }
 
+  let healthlog: HealthLogConfig | undefined;
+  if (exporters.includes('healthlog')) {
+    const baseUrl = process.env.HEALTHLOG_BASE_URL?.trim();
+    if (!baseUrl) {
+      fail('HEALTHLOG_BASE_URL is required when healthlog exporter is enabled.');
+    }
+    const token = process.env.HEALTHLOG_TOKEN?.trim();
+    if (!token) {
+      fail('HEALTHLOG_TOKEN is required when healthlog exporter is enabled.');
+    }
+    healthlog = {
+      baseUrl,
+      token,
+      syncMeasurements: parseBoolean(
+        'HEALTHLOG_SYNC_MEASUREMENTS',
+        process.env.HEALTHLOG_SYNC_MEASUREMENTS?.trim(),
+        true,
+      ),
+    };
+  }
+
+  let dreeve: DreeveConfig | undefined;
+  if (exporters.includes('dreeve')) {
+    const baseUrl = process.env.DREEVE_BASE_URL?.trim();
+    if (!baseUrl) {
+      fail('DREEVE_BASE_URL is required when dreeve exporter is enabled.');
+    }
+    const token = process.env.DREEVE_TOKEN?.trim();
+    if (!token) {
+      fail('DREEVE_TOKEN is required when dreeve exporter is enabled.');
+    }
+    const rawUnit = process.env.DREEVE_UNIT_SYSTEM?.trim() ?? '';
+    const unitSystem = parseDreeveUnitSystem(rawUnit);
+    if (!unitSystem) {
+      fail(
+        `DREEVE_UNIT_SYSTEM must be metric or imperial when dreeve exporter is enabled, got '${rawUnit}'.`,
+      );
+    }
+    dreeve = { baseUrl, token, unitSystem };
+  }
+
   return {
     exporters,
+    garmin,
     mqtt,
     webhook,
     influxdb,
@@ -372,5 +476,7 @@ export function loadExporterConfig(): ExporterConfig {
     intervals,
     runalyze,
     wger,
+    healthlog,
+    dreeve,
   };
 }

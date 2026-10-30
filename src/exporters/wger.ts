@@ -4,7 +4,8 @@ import type { Exporter, ExportContext, ExportResult } from '../interfaces/export
 import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { WgerConfig } from './config.js';
 import { toLocalDate } from './intervals.js';
-import { withRetry, httpError } from '../utils/retry.js';
+import { withRetry, httpError, NonRetryableError } from '../utils/retry.js';
+import { sendWithRetry, probe } from './http.js';
 import { errMsg } from '../utils/error.js';
 
 const log = createLogger('Wger');
@@ -46,7 +47,8 @@ export const wgerSchema: ExporterSchema = {
 const MEASUREMENT_CATEGORIES: ReadonlyArray<{
   name: string;
   unit: string;
-  value: (d: BodyComposition) => number;
+  /** null when the value was withheld (#497): nothing is sent for it. */
+  value: (d: BodyComposition) => number | null;
 }> = [
   { name: 'Body Fat', unit: '%', value: (d) => d.bodyFatPercent },
   { name: 'Body Water', unit: '%', value: (d) => d.waterPercent },
@@ -54,9 +56,30 @@ const MEASUREMENT_CATEGORIES: ReadonlyArray<{
   { name: 'Bone Mass', unit: 'kg', value: (d) => d.boneMass },
 ];
 
+/** Exact: 1 lb = 0.45359237 kg by definition. */
+const LB_PER_KG = 1 / 0.45359237;
+
+type WgerWeightUnit = 'kg' | 'lb';
+
+/**
+ * `GET /api/v2/userprofile/` is one object (the logged-in user's profile) on
+ * every wger version checked, 2.4 to master; a paginated `results` wrapper is
+ * accepted too rather than read as "no unit".
+ */
+interface UserProfileResponse {
+  weight_unit?: unknown;
+  results?: Array<{ weight_unit?: unknown }>;
+}
+
+/**
+ * Opaque, only passed back to the server: a UUID string since wger 2.6, an
+ * integer before.
+ */
+type WgerCategoryId = string | number;
+
 interface CategoryListResponse {
   next: string | null;
-  results: Array<{ id: number; name: string; unit: string }>;
+  results: Array<{ id: WgerCategoryId; name: string; unit: string }>;
 }
 
 export class WgerExporter implements Exporter {
@@ -65,7 +88,7 @@ export class WgerExporter implements Exporter {
   private readonly config: WgerConfig;
   private readonly apiBase: string;
   /** name -> category id, resolved lazily on first export and cached. */
-  private categories: Map<string, number> | null = null;
+  private categories: Map<string, WgerCategoryId> | null = null;
 
   constructor(config: WgerConfig) {
     this.config = config;
@@ -83,19 +106,31 @@ export class WgerExporter implements Exporter {
   async export(data: BodyComposition, context?: ExportContext): Promise<ExportResult> {
     const date = toLocalDate(context?.timestamp ?? new Date());
 
-    // Weight is the primary result: its failure fails the export.
-    const weightResult = await withRetry(
+    // wger interprets a weight entry in the unit of the user's profile and the
+    // API takes no unit of its own (WeightEntryViewSet.perform_create stamps
+    // `profile.weight_unit`), so kilograms written to a pound profile were
+    // stored as pounds (F-03). Read the unit on every export, so a profile
+    // switched to pounds later is followed; without it, nothing is written.
+    let unit = 'kg' as WgerWeightUnit;
+    const unitResult = await withRetry(
       async () => {
-        const response = await fetch(`${this.apiBase}/weightentry/`, {
-          method: 'POST',
-          headers: this.headers(),
-          body: JSON.stringify({ date, weight: Number(data.weight.toFixed(2)) }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!response.ok) {
-          throw httpError(response.status);
-        }
+        unit = await this.fetchWeightUnit();
         return { success: true };
+      },
+      { log, label: 'Wger user profile' },
+    );
+    if (!unitResult.success) {
+      return unitResult;
+    }
+    const weight = unit === 'lb' ? data.weight * LB_PER_KG : data.weight;
+
+    // Weight is the primary result: its failure fails the export.
+    const weightResult = await sendWithRetry(
+      `${this.apiBase}/weightentry/`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ date, weight: Number(weight.toFixed(2)) }),
       },
       { log, label: 'Wger weight entry' },
     );
@@ -103,7 +138,7 @@ export class WgerExporter implements Exporter {
     if (!weightResult.success) {
       return weightResult;
     }
-    log.info(`Wger weight entry pushed for ${date}.`);
+    log.info(`Wger weight entry pushed for ${date}${unit === 'lb' ? ' (in lb)' : ''}.`);
 
     // Body composition is best-effort: a failure here is logged, not fatal.
     if (this.config.syncMeasurements) {
@@ -121,22 +156,16 @@ export class WgerExporter implements Exporter {
     const categories = await this.resolveCategories();
     for (const cat of MEASUREMENT_CATEGORIES) {
       const value = cat.value(data);
-      if (!Number.isFinite(value) || value <= 0) continue;
+      if (value === null || !Number.isFinite(value) || value <= 0) continue;
       const categoryId = categories.get(cat.name);
       if (categoryId === undefined) continue;
 
-      const result = await withRetry(
-        async () => {
-          const response = await fetch(`${this.apiBase}/measurement/`, {
-            method: 'POST',
-            headers: this.headers(),
-            body: JSON.stringify({ category: categoryId, date, value: Number(value.toFixed(2)) }),
-            signal: AbortSignal.timeout(10_000),
-          });
-          if (!response.ok) {
-            throw httpError(response.status);
-          }
-          return { success: true };
+      const result = await sendWithRetry(
+        `${this.apiBase}/measurement/`,
+        {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify({ category: categoryId, date, value: Number(value.toFixed(2)) }),
         },
         { log, label: `Wger ${cat.name} measurement` },
       );
@@ -146,11 +175,33 @@ export class WgerExporter implements Exporter {
     }
   }
 
+  /**
+   * The weight unit of the token's wger profile. A profile without the field
+   * is a server that predates it and stores kilograms; a value other than
+   * `kg` or `lb` is refused rather than guessed at.
+   */
+  private async fetchWeightUnit(): Promise<WgerWeightUnit> {
+    const response = await fetch(`${this.apiBase}/userprofile/`, {
+      headers: this.headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      throw httpError(response.status, 'Wger user profile');
+    }
+    const json = (await response.json()) as UserProfileResponse;
+    const raw = Array.isArray(json.results) ? json.results[0]?.weight_unit : json.weight_unit;
+    if (raw === undefined || raw === null || raw === 'kg') return 'kg';
+    if (raw === 'lb') return 'lb';
+    throw new NonRetryableError(
+      `Wger profile weight unit '${String(raw)}' is not kg or lb; weight not written`,
+    );
+  }
+
   /** List existing measurement categories, create any missing ones, cache name->id. */
-  private async resolveCategories(): Promise<Map<string, number>> {
+  private async resolveCategories(): Promise<Map<string, WgerCategoryId>> {
     if (this.categories) return this.categories;
 
-    const map = new Map<string, number>();
+    const map = new Map<string, WgerCategoryId>();
     let url: string | null = `${this.apiBase}/measurement-category/`;
     let pages = 0;
     while (url && pages < 50) {
@@ -180,7 +231,7 @@ export class WgerExporter implements Exporter {
       if (!response.ok) {
         throw httpError(response.status);
       }
-      const created = (await response.json()) as { id: number };
+      const created = (await response.json()) as { id: WgerCategoryId };
       map.set(cat.name, created.id);
     }
 
@@ -189,17 +240,6 @@ export class WgerExporter implements Exporter {
   }
 
   async healthcheck(): Promise<ExportResult> {
-    try {
-      const response = await fetch(`${this.apiBase}/userprofile/`, {
-        headers: this.headers(),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) {
-        return { success: false, error: `HTTP ${response.status}` };
-      }
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    return probe(`${this.apiBase}/userprofile/`, { headers: this.headers() });
   }
 }

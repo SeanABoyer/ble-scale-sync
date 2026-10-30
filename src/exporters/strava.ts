@@ -6,7 +6,19 @@ import type { Exporter, ExportContext, ExportResult } from '../interfaces/export
 import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { StravaConfig } from './config.js';
 import { withRetry, httpError } from '../utils/retry.js';
+import { probe } from './http.js';
+import { errMsg } from '../utils/error.js';
+import { cliCommand } from '../cli-invocation.js';
+import { atomicWrite } from '../config/write.js';
+import { configDir } from '../config/paths.js';
+import { resolveTokenDir } from '../config/token-dirs.js';
 const log = createLogger('Strava');
+
+/**
+ * Seconds before `expires_at` at which the access token is refreshed anyway,
+ * so the token cannot run out between this check and the PUT that uses it.
+ */
+const TOKEN_REFRESH_MARGIN_SEC = 300;
 
 interface StravaTokens {
   access_token: string;
@@ -54,6 +66,36 @@ export class StravaExporter implements Exporter {
     this.config = config;
   }
 
+  /**
+   * Read the athlete profile with whatever token is on disk, refreshing it
+   * first if it has expired.
+   *
+   * This exporter had no healthcheck at all, though it is one of the two most
+   * likely to be holding a token that has stopped working: the wizard's
+   * validation step and the startup check both simply skipped it (#406).
+   * A GET is used rather than the PUT the export does, so a check never
+   * changes the athlete's weight.
+   *
+   * It is not free of side effects, though: an expired access token is
+   * refreshed first, and Strava rotates the refresh token on every exchange, so
+   * the token file is rewritten. That is deliberate - a check that reported
+   * "fine" on a token it could not actually use would be worthless - but it
+   * means the startup healthcheck can write to disk.
+   */
+  async healthcheck(): Promise<ExportResult> {
+    try {
+      const accessToken = await this.ensureFreshToken(this.loadTokens());
+      return await probe('https://www.strava.com/api/v3/athlete', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+    } catch (err) {
+      // A missing or malformed token file, or a refresh that was refused: all
+      // of them mean this exporter cannot work, which is what a healthcheck is
+      // for.
+      return { success: false, error: errMsg(err) };
+    }
+  }
+
   async export(data: BodyComposition, _context?: ExportContext): Promise<ExportResult> {
     return withRetry(
       async () => {
@@ -85,7 +127,7 @@ export class StravaExporter implements Exporter {
     const tokenPath = this.tokenFilePath();
     if (!fs.existsSync(tokenPath)) {
       throw new Error(
-        `Strava token file not found at ${tokenPath}. Run "npm run setup-strava" first.`,
+        `Strava token file not found at ${tokenPath}. Run "${cliCommand('setup-strava')}" first.`,
       );
     }
     const raw = fs.readFileSync(tokenPath, 'utf-8');
@@ -93,18 +135,21 @@ export class StravaExporter implements Exporter {
       return JSON.parse(raw) as StravaTokens;
     } catch {
       throw new Error(
-        `Malformed token file at ${tokenPath}. Delete it and run "npm run setup-strava" again.`,
+        `Malformed token file at ${tokenPath}. Delete it and run "${cliCommand('setup-strava')}" again.`,
       );
     }
   }
 
   private async ensureFreshToken(tokens: StravaTokens): Promise<string> {
     const now = Math.floor(Date.now() / 1000);
-    if (tokens.expires_at > now) {
+    // Refresh ahead of the deadline: a token with two seconds left passes a
+    // bare `> now` check and expires before the PUT lands, which answers 401,
+    // a non-retryable failure (F-14).
+    if (tokens.expires_at - TOKEN_REFRESH_MARGIN_SEC > now) {
       return tokens.access_token;
     }
 
-    log.info('Access token expired, refreshing...');
+    log.info('Access token expired or about to, refreshing...');
     const response = await fetch('https://www.strava.com/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -138,16 +183,29 @@ export class StravaExporter implements Exporter {
     return updated.access_token;
   }
 
+  /**
+   * Strava invalidates the old refresh token the moment it returns a new one,
+   * so this write must not lose it: atomicWrite goes through a fresh 0600 tmp
+   * file and a rename. The old in-place writeFileSync could truncate the file
+   * and then fail, and its `mode` applied only when the file was created, so a
+   * token file that already existed as 0644 stayed readable to other accounts.
+   */
   private saveTokens(tokens: StravaTokens): void {
     const tokenPath = this.tokenFilePath();
     const dir = path.dirname(tokenPath);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2) + '\n', { mode: 0o600 });
+    atomicWrite(tokenPath, JSON.stringify(tokens, null, 2) + '\n');
   }
 
+  /**
+   * A relative token_dir is next to config.yaml, not in the working directory
+   * (F-11), the same directory `setup-strava` writes to. Config loading
+   * already made it absolute; this covers an entry built directly from the
+   * YAML (the wizard's connectivity test).
+   */
   private tokenFilePath(): string {
-    return path.join(this.config.tokenDir, 'strava_tokens.json');
+    return path.join(resolveTokenDir(this.config.tokenDir, configDir()), 'strava_tokens.json');
   }
 }

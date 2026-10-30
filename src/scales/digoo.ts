@@ -3,15 +3,31 @@ import type {
   ConnectionContext,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
   ScaleReading,
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { uuid16, buildPayload, type ScaleBodyComp } from './body-comp-helpers.js';
+import {
+  uuid16,
+  buildPayload,
+  WEIGHT_ONLY_HOLD_MS,
+  type ScaleBodyComp,
+} from './body-comp-helpers.js';
 import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
 
 const CHR_NOTIFY = uuid16(0xfff1);
 const CHR_WRITE = uuid16(0xfff2);
+
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class DigooSession {
+  /** Cached body-composition values from the most recent parsed frame. */
+  cachedComp: ScaleBodyComp = {};
+  /** Tracks whether the weight reading is stable. */
+  stable = false;
+  /** Tracks whether all body-comp values are present. */
+  allValues = false;
+}
 
 /**
  * Adapter for Digoo / "Mengii" BLE body-fat scales.
@@ -24,21 +40,16 @@ const CHR_WRITE = uuid16(0xfff2);
  *   - When all-values bit set:
  *     fat at [6-7] BE / 10, visceral at [10] / 10,
  *     water at [11-12] BE / 10, muscle at [16-17] BE / 10, bone at [18] / 10
- *   - Complete when weight > 0 and both stable and all-values bits are set
+ *   - Complete on a stable weight or the all-values frame; final (composition present)
+ *     only on all-values, so a weigh-in without it completes weight-only (D028)
  */
-export class DigooScaleAdapter implements ScaleAdapterCore, GattWiring {
+export class DigooScaleAdapter implements ScaleAdapterCore, GattWiring, HoldForComposition {
   readonly name = 'Digoo';
   readonly match: MatchDescriptor = { priority: 80, names: { exact: ['mengii'] } };
   readonly charNotifyUuid = CHR_NOTIFY;
   readonly charWriteUuid = CHR_WRITE;
-  readonly normalizesWeight = true;
 
-  /** Cached body-composition values from the most recent parsed frame. */
-  private cachedComp: ScaleBodyComp = {};
-  /** Tracks whether the weight reading is stable. */
-  private stable = false;
-  /** Tracks whether all body-comp values are present. */
-  private allValues = false;
+  private s = new DigooSession();
 
   matches(device: BleDeviceInfo): boolean {
     return matchesDescriptor(device, this.match);
@@ -79,24 +90,24 @@ export class DigooScaleAdapter implements ScaleAdapterCore, GattWiring {
    *   [18]     bone mass / 10
    *   [19]     (remaining byte)
    */
-  parseNotification(data: Buffer): ScaleReading | null {
+  parseNotification(data: Buffer): ScaleReading<ScaleBodyComp> | null {
     if (data.length < 19) return null;
 
     const weight = data.readUInt16BE(3) / 100;
     if (weight <= 0 || !Number.isFinite(weight)) return null;
 
     const control = data[5];
-    this.stable = (control & 0x01) !== 0;
-    this.allValues = (control & 0x02) !== 0;
+    this.s.stable = (control & 0x01) !== 0;
+    this.s.allValues = (control & 0x02) !== 0;
 
-    if (this.allValues) {
+    if (this.s.allValues) {
       const fat = data.readUInt16BE(6) / 10;
       const visceral = data[10] / 10;
       const water = data.readUInt16BE(11) / 10;
       const muscle = data.readUInt16BE(16) / 10;
       const bone = data[18] / 10;
 
-      this.cachedComp = {
+      this.s.cachedComp = {
         fat: fat > 0 ? fat : undefined,
         visceralFat: visceral > 0 ? visceral : undefined,
         water: water > 0 ? water : undefined,
@@ -104,17 +115,44 @@ export class DigooScaleAdapter implements ScaleAdapterCore, GattWiring {
         bone: bone > 0 ? bone : undefined,
       };
     } else {
-      this.cachedComp = {};
+      this.s.cachedComp = {};
     }
 
-    return { weight, impedance: 0 };
+    return { weight, impedance: 0, scaleComposition: this.s.cachedComp };
   }
 
+  /**
+   * A stable weight, or the all-values frame, completes the reading; only the
+   * all-values frame makes it final (ADR D028, review D-07).
+   *
+   * Requiring both bits at once had two ways to lose a weigh-in. One the scale
+   * could not analyse (socks, a child) never sets all-values, so the session ran
+   * into its timeout. And openScale's DigooDGSO38HHandler publishes only from an
+   * all-values frame WITHOUT the stable bit (a stable frame returns early there,
+   * after it asks for the analysis), so a scale that sends them that way never
+   * met the old condition at all. A stable weight now holds the link for
+   * `WEIGHT_ONLY_HOLD_MS` and completes weight-only if no analysis follows.
+   */
   isComplete(reading: ScaleReading): boolean {
-    return reading.weight > 0 && this.stable && this.allValues;
+    return reading.weight > 0 && (this.s.stable || this.s.allValues);
   }
 
-  computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    return buildPayload(reading.weight, reading.impedance, this.cachedComp, profile);
+  readonly completionHoldMs = WEIGHT_ONLY_HOLD_MS;
+
+  isFinal(_reading: ScaleReading): boolean {
+    return this.s.allValues;
+  }
+
+  onSessionStart(): void {
+    this.s = new DigooSession();
+  }
+
+  computeMetrics(reading: ScaleReading<ScaleBodyComp>, profile: UserProfile): BodyComposition {
+    return buildPayload(
+      reading.weight,
+      reading.impedance,
+      reading.scaleComposition ?? this.s.cachedComp,
+      profile,
+    );
   }
 }

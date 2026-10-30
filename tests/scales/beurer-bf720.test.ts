@@ -4,6 +4,7 @@ import { resolveAdapter } from '../../src/scales/resolve.js';
 import type { BleDeviceInfo, ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import { uuid16 } from '../../src/scales/body-comp-helpers.js';
 import { bleLog } from '../../src/ble/types.js';
+import { isHistoricalReading } from '../../src/interfaces/reading-time.js';
 import {
   mockPeripheral,
   defaultProfile,
@@ -44,7 +45,7 @@ describe('BeurerBf720Adapter', () => {
   });
 
   describe('matches()', () => {
-    it.each(['BF720', 'beurer bf105', 'My BF720 Scale', 'BF500', 'BF788', 'BF950'])(
+    it.each(['BF720', 'beurer bf105', 'My BF720 Scale', 'BF500', 'BF788', 'BF950', 'BF915'])(
       'matches name "%s"',
       (name) => {
         expect(makeAdapter().matches(mockPeripheral(name))).toBe(true);
@@ -56,7 +57,9 @@ describe('BeurerBf720Adapter', () => {
     // They must resolve to this adapter (priority 220) on the name alone, the same
     // way BF500 does, so the real consent+bond path runs. "BF950" is the exact
     // advertised name from the #255 log.
-    it.each(['BF788', 'BF950'])(
+    // BF915 (review C-07): routed to Sanitas SBF72/73 by name until now, which
+    // has no bond, no consent code and reads 2a9c only (#335, #417).
+    it.each(['BF788', 'BF950', 'BF915'])(
       'resolves "%s" to the Beurer adapter, not Standard GATT',
       (name) => {
         const info: BleDeviceInfo = { localName: name, serviceUuids: ['181d', '181b'] };
@@ -136,6 +139,16 @@ describe('BeurerBf720Adapter', () => {
   });
 
   describe('parseCharNotification()', () => {
+    it('reports zero impedance when the frame does not carry the field', () => {
+      const a = makeAdapter();
+      // Same frame with bit 9 cleared and the trailing field removed.
+      const noImpedance = Buffer.from('9801c200df1a9701cc2fca21', 'hex');
+      a.parseCharNotification(CHR_WEIGHT, WSS_FRAME);
+      const reading = a.parseCharNotification(CHR_BODYCOMP, noImpedance);
+      expect(reading).not.toBeNull();
+      expect(reading!.impedance).toBe(0);
+    });
+
     it('pairs weight + body composition and decodes native values', () => {
       const a = makeAdapter();
       expect(a.parseCharNotification(CHR_WEIGHT, WSS_FRAME)).toBeNull();
@@ -150,6 +163,11 @@ describe('BeurerBf720Adapter', () => {
       expect(reading!.timestamp!.getMonth()).toBe(4); // May (0-based)
       expect(reading!.timestamp!.getDate()).toBe(12);
 
+      // Bit 9 of the flags is set in this capture and the field was skipped as
+      // "unused", so every reading from this family carried a false zero (#354).
+      // 0x11a8 = 4520 at 0.1 ohm per LSB, a plausible whole-body value at 80 kg.
+      expect(reading!.impedance).toBeCloseTo(452.0, 1);
+
       const payload = a.computeMetrics(reading!, defaultProfile());
       assertPayloadRanges(payload);
       expect(payload.bodyFatPercent).toBeCloseTo(19.4, 1);
@@ -159,7 +177,9 @@ describe('BeurerBf720Adapter', () => {
       expect(payload.waterPercent).toBeLessThan(65);
     });
 
-    it('treats a freshly stamped weigh-in as a live (non-backdated) reading', () => {
+    // D027: the adapter passes the frame's time on, live or not, and the
+    // runtime decides from its age whether it is a stored record.
+    it('stamps a fresh weigh-in with its own time, which the runtime reads as live', () => {
       const a = makeAdapter();
       const now = new Date();
       const wss = Buffer.alloc(10);
@@ -177,7 +197,8 @@ describe('BeurerBf720Adapter', () => {
       const reading = a.parseCharNotification(CHR_BODYCOMP, bcs);
       expect(reading).not.toBeNull();
       expect(reading!.weight).toBeCloseTo(80, 2);
-      expect(reading!.timestamp).toBeUndefined();
+      expect(reading!.timestamp).toBeInstanceOf(Date);
+      expect(isHistoricalReading(reading!)).toBe(false);
     });
 
     // #168 review: a malformed/truncated BCS frame whose flags claim optional
@@ -317,8 +338,7 @@ describe('BeurerBf720Adapter', () => {
       });
     });
 
-    // lb frames: normalizesWeight = true tells the shared layer this adapter
-    // already returns kg, so it skips its own conversion.
+    // lb frames: nothing after the decoder converts, so it returns kg itself.
     it('converts an lb-unit weight frame to kg', () => {
       const a = makeAdapter();
       const lb = Buffer.alloc(3);
@@ -336,23 +356,77 @@ describe('BeurerBf720Adapter', () => {
       atCaptureTime(() => {
         const a = makeAdapter();
         a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
-        const sentinel = Buffer.from('9803ffff962300000000000000000', 'hex');
+        // The captured zeroed stub (ZEROED_COMP) with its fat field set to 0xFFFF.
+        const sentinel = Buffer.from('9803ffff96230000000000000000', 'hex');
+        expect(sentinel).toHaveLength(ZEROED_COMP.length);
         expect(a.parseCharNotification(CHR_BODYCOMP, sentinel)).toBeNull();
       });
     });
 
     // A zeroed frame must RESET the cache, not merely skip assignment.
-    // cachedComp is cleared only in onConnected(), so a stale real value would
-    // otherwise be stamped onto every backdated history entry that follows.
+    // cachedComp is otherwise cleared only at the session boundaries, so a stale
+    // real value would be stamped onto every backdated history entry that
+    // follows in the same session.
     it('does not leak a previously decoded body fat onto a later zeroed frame', () => {
       atCaptureTime(() => {
         const a = makeAdapter();
         a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
         expect(a.parseCharNotification(CHR_BODYCOMP, REAL_COMP)).not.toBeNull();
 
-        // History frame: same shape, different weight, paired with a stub.
-        a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
+        // History frame: same shape, paired with a stub. The weight frame
+        // opens a new weigh-in and emits nothing: it used to return a reading
+        // built from the PREVIOUS frame's composition, which on a live weigh-in
+        // ended the session with somebody else's fat (review C-01).
+        expect(a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME)).toBeNull();
         expect(a.parseCharNotification(CHR_BODYCOMP, ZEROED_COMP)).toBeNull();
+      });
+    });
+
+    // Review C-01, the other half: a new weight followed by its own composition
+    // is paired with THAT composition, not the one before it. Both pairs are the
+    // captured frames; the second weight is the #168 frame, so the two weigh-ins
+    // differ in every field.
+    it('pairs each weight with the composition that follows it', () => {
+      atCaptureTime(() => {
+        const a = makeAdapter();
+        a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
+        const first = a.parseCharNotification(CHR_BODYCOMP, REAL_COMP);
+        expect(first!.impedance).toBeCloseTo(392.5, 1);
+
+        expect(a.parseCharNotification(CHR_WEIGHT, WSS_FRAME)).toBeNull();
+        const second = a.parseCharNotification(CHR_BODYCOMP, BCS_FRAME);
+        expect(second!.weight).toBeCloseTo(79.96, 2);
+        expect(second!.impedance).toBeCloseTo(452.0, 1);
+        expect(second!.timestamp!.getMonth()).toBe(4); // the #168 frame's May, not July
+        expect(a.computeMetrics(second!, defaultProfile()).bodyFatPercent).toBeCloseTo(19.4, 1);
+      });
+    });
+
+    // D027: the frame's time is the reading's time also for a live weigh-in,
+    // and the user slot the frame names travels with it.
+    it('carries the frame time and user slot on a live weigh-in', () => {
+      atCaptureTime(() => {
+        const a = makeAdapter();
+        a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
+        const reading = a.parseCharNotification(CHR_BODYCOMP, REAL_COMP);
+        expect(reading!.timestamp).toEqual(new Date(2026, 6, 14, 23, 41, 32));
+        expect(isHistoricalReading(reading!)).toBe(false);
+        expect(reading!.userIndex).toBe(1);
+      });
+    });
+
+    // Review C-11 / D028: an impedance of 0xFFFF is the SIG "unavailable"
+    // sentinel. Fixture: REAL_COMP with ONLY its impedance field (last two
+    // bytes) replaced by the spec sentinel; no capture has a scale sending it.
+    it('reports no impedance for the 0xFFFF sentinel instead of 6553.5 ohm', () => {
+      atCaptureTime(() => {
+        const a = makeAdapter();
+        const sentinel = Buffer.from('9803f300962389014042fa2fffff', 'hex');
+        expect(sentinel.subarray(0, 12)).toEqual(REAL_COMP.subarray(0, 12));
+        a.parseCharNotification(CHR_WEIGHT, WEIGHT_FRAME);
+        const reading = a.parseCharNotification(CHR_BODYCOMP, sentinel);
+        expect(reading).not.toBeNull();
+        expect(reading!.impedance).toBe(0);
       });
     });
   });
@@ -962,6 +1036,26 @@ describe('BeurerBf720Adapter', () => {
       }
     });
 
+    // #335: a BF915 answers nothing at all on the User Control Point and then
+    // delivers the measurement on 2a9d anyway, so the unqualified warning fired
+    // on a fully successful session and sent people off to try other slots.
+    it('does not warn about consent silence when the session produced a reading', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      try {
+        const a = makeAdapter();
+        await a.onConnected(ctxWith({}));
+        await settle();
+        // No UCP indication ever arrives; the measurement does.
+        a.parseCharNotification(WEIGHT, WSS_FRAME);
+        expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).not.toBeNull();
+        a.onSessionEnd!();
+        const msg = warn.mock.calls.flat().join(' ');
+        expect(msg).not.toContain('never answered the consent');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it('does not warn about consent silence once the scale has answered', async () => {
       const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
       try {
@@ -1111,5 +1205,60 @@ describe('BeurerBf720Adapter', () => {
       // A weight-only frame in the next session must not resolve on its own.
       expect(a.parseCharNotification(BODYCOMP, BCS_FRAME)).toBeNull();
     });
+  });
+});
+
+/**
+ * Whether a waiting weigh-in shows in the advertisement (#471, D063). The two
+ * payloads are the ones #418 logged on a BF915, verbatim:
+ *   serviceData={0000181d-0000-1000-8000-00805f9b34fb: 01}    reading waiting
+ *   serviceData={0000181d-0000-1000-8000-00805f9b34fb: }      nothing waiting
+ * `00` never occurred there; it is the `01` frame with its one byte changed.
+ */
+describe('BeurerBf720Adapter.advertisesPendingReading (#471)', () => {
+  const adapter = new BeurerBf720Adapter();
+  const LOGGED_UUID = '0000181d-0000-1000-8000-00805f9b34fb';
+  const withServiceData = (uuid: string, data: Buffer): BleDeviceInfo => ({
+    localName: 'BF915',
+    serviceUuids: [],
+    serviceData: [{ uuid, data }],
+  });
+
+  it('says true for 01 and false for the empty payload, as #418 logged them', () => {
+    expect(
+      adapter.advertisesPendingReading(withServiceData(LOGGED_UUID, Buffer.from([0x01]))),
+    ).toBe(true);
+    expect(adapter.advertisesPendingReading(withServiceData(LOGGED_UUID, Buffer.alloc(0)))).toBe(
+      false,
+    );
+  });
+
+  it('says nothing without a 0x181D entry', () => {
+    expect(adapter.advertisesPendingReading({ localName: 'BF915', serviceUuids: [] })).toBe(
+      undefined,
+    );
+    expect(
+      adapter.advertisesPendingReading(
+        withServiceData('0000181b-0000-1000-8000-00805f9b34fb', Buffer.from([0x01])),
+      ),
+    ).toBe(undefined);
+  });
+
+  it('says nothing for 00, the #418 frame with its byte changed', () => {
+    expect(
+      adapter.advertisesPendingReading(withServiceData(LOGGED_UUID, Buffer.from([0x00]))),
+    ).toBe(undefined);
+    expect(
+      adapter.advertisesPendingReading(withServiceData(LOGGED_UUID, Buffer.from([0x01, 0x00]))),
+    ).toBe(undefined);
+  });
+
+  it('takes the 16-bit and the undashed 128-bit form of the UUID', () => {
+    expect(adapter.advertisesPendingReading(withServiceData('181d', Buffer.from([0x01])))).toBe(
+      true,
+    );
+    expect(adapter.advertisesPendingReading(withServiceData(uuid16(0x181d), Buffer.alloc(0)))).toBe(
+      false,
+    );
   });
 });

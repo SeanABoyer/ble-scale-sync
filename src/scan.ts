@@ -6,11 +6,16 @@ import { loadBleConfig } from './config/load.js';
 import { bootstrapMqttProxy } from './ble/mqtt-proxy-bootstrap.js';
 import type { EmbeddedBrokerHandle } from './ble/embedded-broker.js';
 import { errMsg } from './utils/error.js';
+import { toolConfigArg } from './cli-run-args.js';
 
 const log = createLogger('Scan');
 
 async function main(): Promise<void> {
-  const bleConfig = loadBleConfig();
+  // The config.yaml the app would run with, --config included, read with the
+  // same defaults, ${VAR} references and validation for the ble section (G-05).
+  const arg = toolConfigArg(process.argv.slice(2));
+  if (arg.kind === 'error') throw new Error(arg.message);
+  const bleConfig = loadBleConfig(arg.config);
 
   // Set NOBLE_DRIVER before BLE handler import (dynamic import happens in scanDevices)
   if (bleConfig.nobleDriver) {
@@ -36,6 +41,7 @@ async function main(): Promise<void> {
       mqttProxy,
       bleConfig.bleAdapter,
       bleConfig.esphomeProxy,
+      bleConfig.haBluetooth,
     );
   } finally {
     if (embeddedBroker) {
@@ -66,7 +72,14 @@ async function main(): Promise<void> {
     log.info('\nTo pin to a specific scale, set scale_mac in config.yaml or SCALE_MAC in .env:');
     log.info(`  scale_mac: "${recognized[0].address}"`);
     if (recognized.length === 1) {
-      log.info('\nOnly one scale found — auto-discovery will work without scale_mac.');
+      // The default Linux transport never auto-discovers a scale that keeps a
+      // single pairing, so the usual hint would be wrong for it (#408).
+      const only = adapters.find((a) => a.name === recognized[0].matchedAdapter);
+      log.info(
+        only?.singleBond
+          ? '\nOnly one scale found. It keeps a single pairing, so set scale_mac to use it.'
+          : '\nOnly one scale found — auto-discovery will work without scale_mac.',
+      );
     }
   }
 }

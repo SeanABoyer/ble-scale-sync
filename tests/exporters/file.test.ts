@@ -44,6 +44,22 @@ describe('FileExporter', () => {
     vi.mocked(fs.statSync).mockReturnValue({ size: 0 } as ReturnType<typeof fs.statSync>);
   });
 
+  // The file holds every weigh-in with names and body composition. Created
+  // with the default 0666 & ~umask it was world-readable (0644), while the
+  // retry queue holding the same data is 0600 (D014).
+  it.each([
+    ['csv', csvConfig],
+    ['jsonl', jsonlConfig],
+  ])('creates the %s file owner-only (0600)', async (_label, config) => {
+    const exporter = new FileExporter(config);
+    await exporter.export(samplePayload, { userName: 'Alice' });
+    const calls = vi.mocked(fs.appendFileSync).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call[2]).toMatchObject({ mode: 0o600 });
+    }
+  });
+
   it('has name "file"', () => {
     const exporter = new FileExporter(csvConfig);
     expect(exporter.name).toBe('file');
@@ -129,6 +145,83 @@ describe('FileExporter', () => {
       const dataCall = vi.mocked(fs.appendFileSync).mock.calls[1];
       const row = dataCall[1] as string;
       expect(row).toMatch(/,\n$/);
+    });
+  });
+
+  // ─── Metrics only some weigh-ins carry (#497) ─────────────────────────────
+
+  describe('a metric only some weigh-ins carry (#497)', () => {
+    const withSkeletal: BodyComposition = {
+      ...samplePayload,
+      skeletalMusclePercent: 47.8,
+      impedanceTrunk20kHz: 22.2,
+      impedanceRightLeg100kHz: 208.5,
+    };
+
+    // The header is written once, when the file is created: a column that
+    // comes and goes would shift every later one.
+    it('keeps the CSV columns fixed and writes no value for it', async () => {
+      const exporter = new FileExporter(csvConfig);
+      await exporter.export(withSkeletal, { timestamp: new Date('2026-10-23T08:00:00Z') });
+
+      const [header, row] = vi.mocked(fs.appendFileSync).mock.calls.map((c) => c[1] as string);
+      expect(header).toBe(
+        'timestamp,weight,impedance,bmi,body_fat_percent,water_percent,bone_mass,muscle_mass,' +
+          'visceral_fat,physique_rating,bmr,metabolic_age,user\n',
+      );
+      expect(row).toBe('2026-10-23T08:00:00.000Z,72.50,485,23.1,18.5,55.2,3.1,58.4,6,5,1650,25,\n');
+    });
+
+    it('writes it to a JSONL line when the payload has it', async () => {
+      const exporter = new FileExporter(jsonlConfig);
+      await exporter.export(withSkeletal);
+
+      const line = vi.mocked(fs.appendFileSync).mock.calls[0][1] as string;
+      expect(JSON.parse(line)).toMatchObject({
+        skeletalMusclePercent: 47.8,
+        impedanceTrunk20kHz: 22.2,
+        impedanceRightLeg100kHz: 208.5,
+      });
+    });
+
+    it('writes no key for it to a JSONL line when the payload does not have it', async () => {
+      const exporter = new FileExporter(jsonlConfig);
+      await exporter.export(samplePayload);
+
+      const line = vi.mocked(fs.appendFileSync).mock.calls[0][1] as string;
+      expect(Object.keys(JSON.parse(line))).not.toContain('skeletalMusclePercent');
+    });
+  });
+
+  // ─── Withheld values (#497) ───────────────────────────────────────────────
+
+  describe('withheld (null) values (#497)', () => {
+    const withheld: BodyComposition = {
+      ...samplePayload,
+      bodyFatPercent: null,
+      waterPercent: null,
+      boneMass: null,
+      muscleMass: null,
+      visceralFat: null,
+      physiqueRating: null,
+    };
+
+    it('writes an empty CSV cell for each, never the word null', async () => {
+      const exporter = new FileExporter(csvConfig);
+      await exporter.export(withheld, { timestamp: new Date('2026-10-23T08:00:00Z') });
+
+      const row = vi.mocked(fs.appendFileSync).mock.calls[1][1] as string;
+      expect(row).toBe('2026-10-23T08:00:00.000Z,72.50,485,23.1,,,,,,,1650,25,\n');
+    });
+
+    it('writes them to a JSONL line as null', async () => {
+      const exporter = new FileExporter(jsonlConfig);
+      await exporter.export(withheld);
+
+      const parsed = JSON.parse(vi.mocked(fs.appendFileSync).mock.calls[0][1] as string);
+      expect(parsed.bodyFatPercent).toBeNull();
+      expect(parsed.physiqueRating).toBeNull();
+      expect(parsed.bmr).toBe(1650);
     });
   });
 

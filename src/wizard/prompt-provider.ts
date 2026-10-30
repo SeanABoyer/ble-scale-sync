@@ -47,6 +47,7 @@ export async function createRealPromptProvider(): Promise<PromptProvider> {
         choices: choices.map((c) => ({
           name: c.name,
           value: c.value,
+          checked: c.checked,
         })),
       });
     },
@@ -63,39 +64,6 @@ export async function createRealPromptProvider(): Promise<PromptProvider> {
             }
           : undefined,
       });
-    },
-  };
-}
-
-// --- Mock provider (for tests) ---
-
-export function createMockPromptProvider(
-  answers: (string | number | boolean | string[])[],
-): PromptProvider {
-  let index = 0;
-
-  function next(): unknown {
-    if (index >= answers.length) {
-      throw new Error(`Mock prompt provider exhausted — asked for answer #${index + 1}`);
-    }
-    return answers[index++];
-  }
-
-  return {
-    async input() {
-      return String(next());
-    },
-    async select() {
-      return next() as never;
-    },
-    async confirm() {
-      return Boolean(next());
-    },
-    async checkbox() {
-      return next() as never;
-    },
-    async password() {
-      return String(next());
     },
   };
 }

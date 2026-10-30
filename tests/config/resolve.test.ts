@@ -1,10 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import {
+  resolveDisplayUnit,
   resolveUserProfile,
   resolveRuntimeConfig,
   resolveExportersForUser,
+  resolveExporterSlotsForUser,
   resolveForSingleUser,
+  resolveScaleAuth,
+  buildAdapterRuntimeConfig,
 } from '../../src/config/resolve.js';
+import { ADAPTER_BLE_OPTIONS, BleSchema } from '../../src/config/schema.js';
+import { QN_BLE_OPTIONS } from '../../src/scales/qn-scale/options.js';
+import { RMSC04_BLE_OPTIONS } from '../../src/scales/renpho-msc04-options.js';
 import type { AppConfig, UserConfig, ScaleConfig } from '../../src/config/schema.js';
 
 // --- Test data ---
@@ -20,13 +27,19 @@ const USER: UserConfig = {
   last_known_weight: null,
 };
 
-const SCALE_CM: ScaleConfig = { weight_unit: 'kg', height_unit: 'cm' };
-const SCALE_IN: ScaleConfig = { weight_unit: 'lbs', height_unit: 'in' };
+const SCALE_CM: ScaleConfig = { weight_unit: 'kg', height_unit: 'cm', display_unit: 'weight_unit' };
+const SCALE_IN: ScaleConfig = {
+  weight_unit: 'lbs',
+  height_unit: 'in',
+  display_unit: 'weight_unit',
+};
 
 const BASE_CONFIG: AppConfig = {
   version: 1,
   scale: SCALE_CM,
   unknown_user: 'nearest',
+  out_of_range: 'warn',
+  update_check: true,
   users: [USER],
   global_exporters: [{ type: 'garmin' }, { type: 'mqtt', broker_url: 'mqtt://host' }],
   runtime: {
@@ -34,13 +47,36 @@ const BASE_CONFIG: AppConfig = {
     scan_cooldown: 60,
     dry_run: false,
     debug: false,
+    watchdog_max_consecutive_failures: 10,
+    watch_config: true,
+    idle_rescan_delay: 5,
+    no_reading_rescan_delay: 0,
+    retry_failed_exports: true,
   },
   ble: {
+    handler: 'auto',
     scale_mac: 'FF:03:00:13:A1:04',
   },
 };
 
 // --- resolveUserProfile ---
+
+describe('resolveDisplayUnit (#429)', () => {
+  const scale = (over: Partial<ScaleConfig>): ScaleConfig =>
+    ({ weight_unit: 'kg', height_unit: 'cm', display_unit: 'weight_unit', ...over }) as ScaleConfig;
+
+  // #269: before display_unit existed, a QN scale followed weight_unit. The
+  // default has to keep an lb user's scale on lb.
+  it('follows weight_unit by default', () => {
+    expect(resolveDisplayUnit(scale({ weight_unit: 'lbs' }))).toBe('lbs');
+    expect(resolveDisplayUnit(scale({ weight_unit: 'kg' }))).toBe('kg');
+  });
+
+  it('uses an explicit display_unit regardless of weight_unit', () => {
+    expect(resolveDisplayUnit(scale({ weight_unit: 'kg', display_unit: 'st' }))).toBe('st');
+    expect(resolveDisplayUnit(scale({ weight_unit: 'lbs', display_unit: 'kg' }))).toBe('kg');
+  });
+});
 
 describe('resolveUserProfile', () => {
   it('computes age from birth_date', () => {
@@ -49,6 +85,26 @@ describe('resolveUserProfile', () => {
     const expectedAge =
       today.getFullYear() - 1990 - (today < new Date(today.getFullYear(), 5, 15) ? 1 : 0);
     expect(profile.age).toBe(expectedAge);
+  });
+
+  // #75: the QN extended dialect sends this to the scale before the weigh-in
+  // and refuses to complete when it is far from the real weight, so every
+  // configured user needs one without adding a setting.
+  it('uses last_known_weight as the weight anchor when config has one', () => {
+    const profile = resolveUserProfile({ ...USER, last_known_weight: 82.4 }, SCALE_CM);
+    expect(profile.lastKnownWeight).toBe(82.4);
+  });
+
+  it('falls back to the midpoint of weight_range before the first reading', () => {
+    const profile = resolveUserProfile(USER, SCALE_CM);
+    expect(profile.lastKnownWeight).toBe(85);
+  });
+
+  // The env-var config path has no range to ask for and writes this sentinel,
+  // whose midpoint is 499.5 kg. Anything is better than handing a scale that.
+  it('yields no anchor for the env-var sentinel weight range', () => {
+    const profile = resolveUserProfile({ ...USER, weight_range: { min: 0, max: 999 } }, SCALE_CM);
+    expect(profile.lastKnownWeight).toBeUndefined();
   });
 
   it('preserves height in cm when height_unit is cm', () => {
@@ -77,6 +133,19 @@ describe('resolveUserProfile', () => {
     const profile = resolveUserProfile(femaleUser, SCALE_CM);
     expect(profile.gender).toBe('female');
     expect(profile.isAthlete).toBe(false);
+  });
+
+  // #497: only an explicit false reaches the profile, so every profile of a
+  // config without the key is exactly what it was.
+  it('carries estimate_body_composition: false into the profile', () => {
+    const off = resolveUserProfile({ ...USER, estimate_body_composition: false }, SCALE_CM);
+    expect(off.estimateBodyComposition).toBe(false);
+  });
+
+  it('adds nothing for estimate_body_composition true or absent', () => {
+    for (const user of [USER, { ...USER, estimate_body_composition: true }]) {
+      expect(resolveUserProfile(user, SCALE_CM)).not.toHaveProperty('estimateBodyComposition');
+    }
   });
 
   it('computes correct age for birthday not yet passed this year', () => {
@@ -151,6 +220,9 @@ describe('resolveRuntimeConfig', () => {
           broker_url: 'mqtt://localhost:1883',
           device_id: 'esp32-test',
           topic_prefix: 'ble-proxy',
+          embedded_broker_port: 1883,
+          embedded_broker_bind: '0.0.0.0',
+          auto_connect: true,
         },
       },
     };
@@ -160,13 +232,16 @@ describe('resolveRuntimeConfig', () => {
       broker_url: 'mqtt://localhost:1883',
       device_id: 'esp32-test',
       topic_prefix: 'ble-proxy',
+      embedded_broker_port: 1883,
+      embedded_broker_bind: '0.0.0.0',
+      auto_connect: true,
     });
   });
 
   it('extracts bleAdapter from ble config', () => {
     const config = {
       ...BASE_CONFIG,
-      ble: { ...BASE_CONFIG.ble, adapter: 'hci1' },
+      ble: { ...BASE_CONFIG.ble!, adapter: 'hci1' },
     };
     const result = resolveRuntimeConfig(config);
     expect(result.bleAdapter).toBe('hci1');
@@ -219,6 +294,46 @@ describe('resolveExportersForUser', () => {
     expect(entries[1].type).toBe('mqtt');
   });
 
+  // D029 (G-14): several entries of one type in one list are all exported to.
+  // The second global webhook used to be dropped without a word.
+  it('keeps every global entry of a type, not only the first', () => {
+    const config = {
+      ...BASE_CONFIG,
+      global_exporters: [
+        { type: 'webhook', url: 'http://a' },
+        { type: 'webhook', url: 'http://b' },
+      ],
+    } as AppConfig;
+    const entries = resolveExportersForUser(config, USER);
+    expect(entries.map((e) => (e as Record<string, unknown>).url)).toEqual([
+      'http://a',
+      'http://b',
+    ]);
+  });
+
+  it("drops every global entry of a type the user configured, keeps the user's duplicates", () => {
+    const config = {
+      ...BASE_CONFIG,
+      global_exporters: [
+        { type: 'webhook', url: 'http://global' },
+        { type: 'mqtt', broker_url: 'mqtt://x' },
+      ],
+    } as AppConfig;
+    const u = {
+      ...USER,
+      exporters: [
+        { type: 'webhook', url: 'http://mine-1' },
+        { type: 'webhook', url: 'http://mine-2' },
+      ],
+    } as UserConfig;
+    const slots = resolveExporterSlotsForUser(config, u);
+    expect(slots.map((s) => [s.list, s.index, s.entry.type])).toEqual([
+      ['user', 0, 'webhook'],
+      ['user', 1, 'webhook'],
+      ['global', 1, 'mqtt'],
+    ]);
+  });
+
   it('returns empty array when no exporters configured', () => {
     const config = { ...BASE_CONFIG, global_exporters: undefined };
     const entries = resolveExportersForUser(config, USER);
@@ -256,5 +371,165 @@ describe('resolveForSingleUser', () => {
     const result = resolveForSingleUser(config);
     expect(result.exporterEntries).toHaveLength(3); // ntfy + garmin + mqtt
     expect(result.exporterEntries[0].type).toBe('ntfy');
+  });
+});
+
+describe('resolveScaleAuth', () => {
+  it('maps the beurer_* keys of the user', () => {
+    const user: UserConfig = {
+      ...USER,
+      beurer_pin: 1234,
+      beurer_user_index: 2,
+      beurer_provision: true,
+      beurer_register_new_user: false,
+    };
+    expect(resolveScaleAuth(user)).toStrictEqual({
+      pin: 1234,
+      userIndex: 2,
+      provision: true,
+      registerNewUser: false,
+    });
+  });
+
+  it('yields an all-unset auth for no user', () => {
+    expect(resolveScaleAuth(undefined)).toStrictEqual({
+      pin: undefined,
+      userIndex: undefined,
+      provision: undefined,
+      registerNewUser: undefined,
+    });
+  });
+});
+
+describe('buildAdapterRuntimeConfig (X-06)', () => {
+  const UNSET_OPTIONS = {
+    qnProtocolByte: undefined,
+    qnReportByte: undefined,
+    qnWeightAck: undefined,
+    qnUserKey: undefined,
+    qnUserSlot: undefined,
+    qnA4Prelude: undefined,
+    qnTimeSyncLong: undefined,
+    qnConfigLong: undefined,
+    qnResultAck: undefined,
+    rmsc04ProfileByte: undefined,
+  };
+
+  const cases: Array<{
+    name: string;
+    config: AppConfig;
+    scaleMac: string | undefined;
+    expected: Record<string, unknown>;
+  }> = [
+    {
+      name: 'no ble block',
+      config: { ...BASE_CONFIG, ble: undefined },
+      scaleMac: undefined,
+      expected: { bindKey: undefined, scaleMac: undefined, displayUnit: 'kg', ...UNSET_OPTIONS },
+    },
+    {
+      name: 'null ble keys read as unset',
+      config: {
+        ...BASE_CONFIG,
+        ble: {
+          handler: 'auto',
+          bind_key: null,
+          qn_protocol_byte: null,
+          qn_report_byte: null,
+          qn_weight_ack: null,
+          qn_user_key: null,
+          qn_user_slot: null,
+          qn_a4_prelude: null,
+          qn_time_sync_long: null,
+          qn_config_long: null,
+          qn_result_ack: null,
+          rmsc04_profile_byte: null,
+        },
+      },
+      scaleMac: 'FF:03:00:13:A1:04',
+      expected: {
+        bindKey: undefined,
+        scaleMac: 'FF:03:00:13:A1:04',
+        displayUnit: 'kg',
+        ...UNSET_OPTIONS,
+      },
+    },
+    {
+      name: 'every key set, explicit display unit',
+      config: {
+        ...BASE_CONFIG,
+        scale: { ...SCALE_CM, display_unit: 'st' },
+        ble: {
+          handler: 'auto',
+          bind_key: '00112233445566778899aabbccddeeff',
+          qn_protocol_byte: 0x02,
+          qn_report_byte: 0x01,
+          qn_weight_ack: true,
+          qn_user_key: 4321,
+          qn_user_slot: 3,
+          qn_a4_prelude: false,
+          qn_time_sync_long: true,
+          qn_config_long: false,
+          qn_result_ack: true,
+          rmsc04_profile_byte: '9e',
+        },
+      },
+      scaleMac: 'AA:BB:CC:DD:EE:FF',
+      expected: {
+        bindKey: '00112233445566778899aabbccddeeff',
+        scaleMac: 'AA:BB:CC:DD:EE:FF',
+        displayUnit: 'st',
+        qnProtocolByte: 0x02,
+        qnReportByte: 0x01,
+        qnWeightAck: true,
+        qnUserKey: 4321,
+        qnUserSlot: 3,
+        qnA4Prelude: false,
+        qnTimeSyncLong: true,
+        qnConfigLong: false,
+        qnResultAck: true,
+        rmsc04ProfileByte: '9e',
+      },
+    },
+    {
+      name: 'display unit follows weight_unit by default',
+      config: { ...BASE_CONFIG, scale: SCALE_IN },
+      scaleMac: undefined,
+      expected: { bindKey: undefined, scaleMac: undefined, displayUnit: 'lbs', ...UNSET_OPTIONS },
+    },
+  ];
+
+  it.each(cases)('$name', ({ config, scaleMac, expected }) => {
+    const out = buildAdapterRuntimeConfig(config, scaleMac);
+    expect(out).toStrictEqual({ ...expected, userWeights: config.users });
+    // The live entries, not copies: the processor moves last_known_weight on them.
+    expect(out.userWeights).toBe(config.users);
+  });
+
+  // An adapter-owned key added to the schema outside its fragment, or a fragment
+  // left out of ADAPTER_BLE_OPTIONS, would be accepted by validation and then
+  // silently ignored by every adapter.
+  it('wires every adapter-owned ble.* key through', () => {
+    const shape = BleSchema.shape as Record<
+      string,
+      { safeParse(v: unknown): { success: boolean } }
+    >;
+    expect(Object.keys(ADAPTER_BLE_OPTIONS)).toEqual([
+      ...Object.keys(QN_BLE_OPTIONS),
+      ...Object.keys(RMSC04_BLE_OPTIONS),
+    ]);
+    // Every key with an adapter's prefix comes from a fragment, nothing else.
+    expect(Object.keys(shape).filter((k) => /^(qn|rmsc04)_/.test(k))).toEqual(
+      Object.keys(ADAPTER_BLE_OPTIONS),
+    );
+    for (const key of Object.keys(ADAPTER_BLE_OPTIONS)) {
+      expect(shape[key], `${key} is not in BleSchema`).toBeDefined();
+      const value = [true, 7, '9e'].find((v) => shape[key].safeParse(v).success);
+      expect(value, `no test value for ${key}`).toBeDefined();
+      const config = { ...BASE_CONFIG, ble: { handler: 'auto', [key]: value } } as AppConfig;
+      const field = key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+      const out = buildAdapterRuntimeConfig(config, undefined) as Record<string, unknown>;
+      expect(out[field], `${key} -> ${field}`).toBe(value);
+    }
   });
 });

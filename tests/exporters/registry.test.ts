@@ -14,13 +14,73 @@ import { FileExporter } from '../../src/exporters/file.js';
 import { StravaExporter } from '../../src/exporters/strava.js';
 import { TelegramExporter } from '../../src/exporters/telegram.js';
 import { IntervalsExporter } from '../../src/exporters/intervals.js';
+import { DreeveExporter } from '../../src/exporters/dreeve.js';
 import type { ExporterEntry } from '../../src/config/schema.js';
+
+// ─── boolean fields from ${ENV_VAR} ────────────────────────────────────────
+//
+// ExporterEntrySchema is passthrough and env references resolve to STRINGS
+// before the schema sees them, so a bare `as boolean` cast read a configured
+// "false" as true: the exact inverse of what the user wrote, silently. The
+// helper was introduced for garmin.weight_only in #373 and now covers every
+// boolean an exporter reads.
+describe('boolean exporter fields resolved from strings', () => {
+  const CASES: Array<[string, string, string]> = [
+    ['mqtt', 'retain', 'retain'],
+    ['mqtt', 'ha_discovery', 'haDiscovery'],
+    ['ntfy', 'report_exports', 'reportExports'],
+    ['telegram', 'silent', 'silent'],
+    ['telegram', 'report_exports', 'reportExports'],
+    ['wger', 'sync_measurements', 'syncMeasurements'],
+    ['healthlog', 'sync_measurements', 'syncMeasurements'],
+    ['garmin', 'weight_only', 'weight_only'],
+    ['garmin', 'skip_metabolic_age', 'skip_metabolic_age'],
+  ];
+
+  const base: Record<string, Record<string, unknown>> = {
+    mqtt: { broker_url: 'mqtt://localhost:1883', topic: 'scale' },
+    ntfy: { topic: 'scale' },
+    telegram: { bot_token: 't', chat_id: '1' },
+    wger: { base_url: 'https://wger.example', token: 'tok' },
+    healthlog: { base_url: 'https://healthlog.example', token: 'tok' },
+    garmin: { email: 'a@b.c', password: 'x' },
+  };
+
+  it.each(CASES)('reads %s.%s = "false" as false, not as true', (type, key, field) => {
+    const entry = { type, ...base[type], [key]: 'false' } as unknown as ExporterEntry;
+    const exporter = createExporterFromEntry(entry) as unknown as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const cfg = Object.values(exporter).find(
+      (v) => v && typeof v === 'object' && field in v,
+    ) as Record<string, unknown>;
+    expect(cfg[field]).toBe(false);
+  });
+
+  it.each(CASES)('reads %s.%s = "true" as true', (type, key, field) => {
+    const entry = { type, ...base[type], [key]: 'true' } as unknown as ExporterEntry;
+    const exporter = createExporterFromEntry(entry) as unknown as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const cfg = Object.values(exporter).find(
+      (v) => v && typeof v === 'object' && field in v,
+    ) as Record<string, unknown>;
+    expect(cfg[field]).toBe(true);
+  });
+
+  it.each(CASES)('throws rather than guessing on %s.%s = "maybe"', (type, key) => {
+    const entry = { type, ...base[type], [key]: 'maybe' } as unknown as ExporterEntry;
+    expect(() => createExporterFromEntry(entry)).toThrow(/must be true or false/);
+  });
+});
 
 // ─── EXPORTER_REGISTRY ─────────────────────────────────────────────────────
 
 describe('EXPORTER_REGISTRY', () => {
-  it('contains 11 exporter entries', () => {
-    expect(EXPORTER_REGISTRY).toHaveLength(11);
+  it('contains 13 exporter entries', () => {
+    expect(EXPORTER_REGISTRY).toHaveLength(13);
   });
 
   it('has entries for all known exporters', () => {
@@ -36,6 +96,8 @@ describe('EXPORTER_REGISTRY', () => {
     expect(names).toContain('intervals');
     expect(names).toContain('runalyze');
     expect(names).toContain('wger');
+    expect(names).toContain('healthlog');
+    expect(names).toContain('dreeve');
   });
 
   it('each entry has a schema and factory', () => {
@@ -53,8 +115,8 @@ describe('EXPORTER_REGISTRY', () => {
 // ─── EXPORTER_SCHEMAS ──────────────────────────────────────────────────────
 
 describe('EXPORTER_SCHEMAS', () => {
-  it('derives 11 schemas from registry', () => {
-    expect(EXPORTER_SCHEMAS).toHaveLength(11);
+  it('derives 13 schemas from registry', () => {
+    expect(EXPORTER_SCHEMAS).toHaveLength(13);
   });
 
   it('each schema has required fields', () => {
@@ -103,14 +165,16 @@ describe('EXPORTER_SCHEMAS', () => {
     expect(urlField!.required).toBe(true);
   });
 
-  it('influxdb schema has 4 required fields', () => {
+  // `org` is deliberately not required: InfluxDB v3 has no organizations, and
+  // the v2-compatible write endpoint ignores the parameter.
+  it('influxdb schema has 3 required fields, org not among them', () => {
     const influxdb = EXPORTER_SCHEMAS.find((s) => s.name === 'influxdb');
     const requiredFields = influxdb!.fields.filter((f) => f.required);
-    expect(requiredFields).toHaveLength(4);
+    expect(requiredFields).toHaveLength(3);
     const keys = requiredFields.map((f) => f.key);
     expect(keys).toContain('url');
     expect(keys).toContain('token');
-    expect(keys).toContain('org');
+    expect(keys).not.toContain('org');
     expect(keys).toContain('bucket');
   });
 
@@ -209,14 +273,43 @@ describe('EXPORTER_SCHEMAS', () => {
     const requiredFields = wger!.fields.filter((f) => f.required);
     expect(requiredFields.map((f) => f.key).sort()).toEqual(['base_url', 'token']);
   });
+
+  it('healthlog schema supports per-user only', () => {
+    const healthlog = EXPORTER_SCHEMAS.find((s) => s.name === 'healthlog');
+    expect(healthlog).toBeDefined();
+    expect(healthlog!.supportsGlobal).toBe(false);
+    expect(healthlog!.supportsPerUser).toBe(true);
+  });
+
+  it('healthlog schema has base_url and token as required fields', () => {
+    const healthlog = EXPORTER_SCHEMAS.find((s) => s.name === 'healthlog');
+    const requiredFields = healthlog!.fields.filter((f) => f.required);
+    expect(requiredFields.map((f) => f.key).sort()).toEqual(['base_url', 'token']);
+  });
+
+  it('dreeve schema supports per-user only', () => {
+    const dreeve = EXPORTER_SCHEMAS.find((s) => s.name === 'dreeve');
+    expect(dreeve).toBeDefined();
+    expect(dreeve!.supportsGlobal).toBe(false);
+    expect(dreeve!.supportsPerUser).toBe(true);
+  });
+
+  it('dreeve schema requires base_url, token and unit_system', () => {
+    const dreeve = EXPORTER_SCHEMAS.find((s) => s.name === 'dreeve');
+    const required = dreeve!.fields
+      .filter((f) => f.required)
+      .map((f) => f.key)
+      .sort();
+    expect(required).toEqual(['base_url', 'token', 'unit_system']);
+  });
 });
 
 // ─── KNOWN_EXPORTER_NAMES ──────────────────────────────────────────────────
 
 describe('KNOWN_EXPORTER_NAMES', () => {
-  it('is a Set with 11 entries', () => {
+  it('is a Set with 13 entries', () => {
     expect(KNOWN_EXPORTER_NAMES).toBeInstanceOf(Set);
-    expect(KNOWN_EXPORTER_NAMES.size).toBe(11);
+    expect(KNOWN_EXPORTER_NAMES.size).toBe(13);
   });
 
   it('contains all exporter names', () => {
@@ -231,6 +324,25 @@ describe('KNOWN_EXPORTER_NAMES', () => {
     expect(KNOWN_EXPORTER_NAMES.has('intervals')).toBe(true);
     expect(KNOWN_EXPORTER_NAMES.has('runalyze')).toBe(true);
     expect(KNOWN_EXPORTER_NAMES.has('wger')).toBe(true);
+    expect(KNOWN_EXPORTER_NAMES.has('healthlog')).toBe(true);
+    expect(KNOWN_EXPORTER_NAMES.has('dreeve')).toBe(true);
+  });
+});
+
+// #406: three hand-maintained lists of the same eleven names. Adding a twelfth
+// exporter per the documented steps but forgetting config.ts passes lint,
+// typecheck and the whole suite, and then rejects EXPORTERS=x at runtime with
+// "Unknown exporter". This is the cheapest guard against that.
+describe('the exporter name lists agree', () => {
+  it('KNOWN_EXPORTERS in config.ts matches the registry', async () => {
+    const { _knownExporterNamesForTest } = await import('../../src/exporters/config.js');
+    expect([..._knownExporterNamesForTest].sort()).toEqual([...KNOWN_EXPORTER_NAMES].sort());
+  });
+
+  it('has one registry entry per known name, with no duplicates', () => {
+    // A duplicated schema name would make the derived set smaller than the
+    // registry, and the equality test above would still pass.
+    expect(KNOWN_EXPORTER_NAMES.size).toBe(EXPORTER_REGISTRY.length);
   });
 });
 
@@ -443,5 +555,27 @@ describe('createExporterFromEntry()', () => {
     const exporter = createExporterFromEntry(entry);
     expect(exporter).toBeInstanceOf(IntervalsExporter);
     expect(exporter.name).toBe('intervals');
+  });
+
+  it('creates DreeveExporter from entry', () => {
+    const exporter = createExporterFromEntry({
+      type: 'dreeve',
+      base_url: 'https://fit.example.com',
+      token: 'drv_abc123',
+      unit_system: 'metric',
+    });
+    expect(exporter).toBeInstanceOf(DreeveExporter);
+    expect(exporter.name).toBe('dreeve');
+  });
+
+  it('rejects a Dreeve entry with an invalid unit_system', () => {
+    expect(() =>
+      createExporterFromEntry({
+        type: 'dreeve',
+        base_url: 'https://fit.example.com',
+        token: 'drv_abc123',
+        unit_system: 'pounds',
+      }),
+    ).toThrow('unit_system');
   });
 });

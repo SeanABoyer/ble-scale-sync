@@ -1,4 +1,5 @@
 import type { BleDeviceInfo } from '../interfaces/scale-adapter.js';
+import { SVC_FE95, miBeaconProductId, normUuid } from './mibeacon.js';
 
 /** Name predicates an adapter claims. All tokens MUST be lowercase. */
 export interface NameClaim {
@@ -33,10 +34,23 @@ export interface MatchDescriptor {
   charUuids?: string[];
   /** Manufacturer company id this adapter claims (a weak signal on its own). */
   manufacturerId?: number;
+  /**
+   * MiBeacon product ids this adapter claims: bytes 2-3, little-endian, of the
+   * Xiaomi 0xFE95 service data. Xiaomi assigns them per model (a model may have
+   * several), so like a name an id says which device this is, and
+   * resolveAfterDiscovery keeps a pick made on it (#474).
+   */
+  miBeaconProductIds?: number[];
   custom?: boolean;
 }
 
-/** Lowercase and strip dashes from a UUID for comparison. */
+/**
+ * Lowercase and strip dashes from a UUID for comparison.
+ *
+ * Note for anyone writing a claim: tokens here are 4-char (16-bit) or full
+ * 32-char. A 32-bit, 8-char token would NOT work, because this pair does not
+ * expand it the way `normalizeUuid` in the BLE layer does (#406).
+ */
 function norm(u: string): string {
   return u.toLowerCase().replace(/-/g, '');
 }
@@ -71,17 +85,49 @@ export function uuidClaimHits(claims: string[], deviceUuids: string[] | undefine
   });
 }
 
+/** True if the device's advertised name hits one of the descriptor's name claims. */
+export function nameClaimHits(d: MatchDescriptor, localName: string | undefined): boolean {
+  const name = (localName || '').toLowerCase();
+  if (!name || !d.names) return false;
+  if (d.names.exact?.includes(name)) return true;
+  if (d.names.includes?.some((n) => name.includes(n))) return true;
+  if (d.names.startsWith?.some((p) => name.startsWith(p))) return true;
+  return false;
+}
+
+/** True if the device's 0xFE95 service data carries a product id the descriptor claims. */
+export function miBeaconClaimHits(d: MatchDescriptor, device: BleDeviceInfo): boolean {
+  const ids = d.miBeaconProductIds;
+  if (!ids || ids.length === 0) return false;
+  return (device.serviceData ?? []).some((sd) => {
+    if (normUuid(sd.uuid) !== SVC_FE95) return false;
+    const pid = miBeaconProductId(sd.data);
+    return pid !== null && ids.includes(pid);
+  });
+}
+
 /** Evaluate the common (data-expressible) match predicates. */
 export function matchesDescriptor(device: BleDeviceInfo, d: MatchDescriptor): boolean {
-  const name = (device.localName || '').toLowerCase();
-  if (d.names) {
-    if (name && d.names.exact?.includes(name)) return true;
-    if (name && d.names.includes?.some((n) => name.includes(n))) return true;
-    if (name && d.names.startsWith?.some((p) => name.startsWith(p))) return true;
-  }
+  if (nameClaimHits(d, device.localName)) return true;
+  if (miBeaconClaimHits(d, device)) return true;
   if (d.serviceUuids && uuidClaimHits(d.serviceUuids, device.serviceUuids)) return true;
   if (d.charUuids && uuidClaimHits(d.charUuids, device.characteristicUuids)) return true;
   return false;
+}
+
+/**
+ * The six bytes of a transport-reported address, uppercase hex without
+ * separators, or null when the transport has none (noble on macOS reports
+ * `<unknown>`).
+ *
+ * For adapters whose claim is the device's own address echoed inside its
+ * manufacturer data: a device that is not the scale will not happen to carry
+ * the address it is transmitting from, so the claim validates itself.
+ */
+export function ownAddressBytes(address: string | undefined): string | null {
+  if (!address) return null;
+  const clean = address.replace(/[:-]/g, '').toUpperCase();
+  return /^[0-9A-F]{12}$/.test(clean) ? clean : null;
 }
 
 /** Union of every name token a descriptor claims (for exclusion / overlap analysis). */

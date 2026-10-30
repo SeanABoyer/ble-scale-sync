@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MqttExporter } from '../../src/exporters/mqtt.js';
 import type { MqttConfig } from '../../src/exporters/config.js';
 import type { BodyComposition } from '../../src/interfaces/scale-adapter.js';
@@ -18,6 +18,10 @@ const samplePayload: BodyComposition = {
   metabolicAge: 30,
 };
 
+const MEASURED_AT = new Date('2026-10-20T21:30:00Z');
+const MEASURED_AT_ISO = '2026-10-20T21:30:00.000Z';
+const STATE_JSON = JSON.stringify({ timestamp: MEASURED_AT_ISO, ...samplePayload });
+
 const defaultConfig: MqttConfig = {
   brokerUrl: 'mqtt://localhost:1883',
   topic: 'scale/body-composition',
@@ -31,31 +35,29 @@ const defaultConfig: MqttConfig = {
 const userContext: ExportContext = {
   userName: 'Dad',
   userSlug: 'dad',
+  timestamp: MEASURED_AT,
 };
 
-const { mockPublishAsync, mockEndAsync, mockConnectAsync } = vi.hoisted(() => {
-  const mockPublishAsync = vi.fn().mockResolvedValue(undefined);
-  const mockEndAsync = vi.fn().mockResolvedValue(undefined);
-  const mockConnectAsync = vi.fn().mockResolvedValue({
-    publishAsync: mockPublishAsync,
-    endAsync: mockEndAsync,
-  });
-  return { mockPublishAsync, mockEndAsync, mockConnectAsync };
+// The exporter uses `mqtt.connect()`, which returns the client synchronously
+// and signals readiness with a 'connect' event, so the fake has to model that
+// rather than resolve a ready client. See tests/helpers/fake-mqtt.ts.
+const { fakeMqtt } = await vi.hoisted(async () => {
+  const { createFakeMqtt } = await import('../helpers/fake-mqtt.js');
+  return { fakeMqtt: createFakeMqtt() };
 });
 
 vi.mock('mqtt', () => ({
-  connectAsync: mockConnectAsync,
+  connect: fakeMqtt.connect,
 }));
 
 describe('MqttExporter multi-user', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockConnectAsync.mockResolvedValue({
-      publishAsync: mockPublishAsync,
-      endAsync: mockEndAsync,
-    });
-    mockPublishAsync.mockResolvedValue(undefined);
-    mockEndAsync.mockResolvedValue(undefined);
+    fakeMqtt.reset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   // ─── Topic routing ──────────────────────────────────────────────────────
@@ -65,33 +67,36 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(defaultConfig);
       await exporter.export(samplePayload, userContext);
 
-      expect(mockPublishAsync).toHaveBeenCalledWith(
-        'scale/body-composition/dad',
-        JSON.stringify(samplePayload),
-        { qos: 1, retain: true },
-      );
+      expect(fakeMqtt.publishAsync).toHaveBeenCalledWith('scale/body-composition/dad', STATE_JSON, {
+        qos: 1,
+        retain: true,
+      });
     });
 
     it('publishes to base topic when no context', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(MEASURED_AT);
       const exporter = new MqttExporter(defaultConfig);
       await exporter.export(samplePayload);
 
-      expect(mockPublishAsync).toHaveBeenCalledWith(
-        'scale/body-composition',
-        JSON.stringify(samplePayload),
-        { qos: 1, retain: true },
-      );
+      expect(fakeMqtt.publishAsync).toHaveBeenCalledWith('scale/body-composition', STATE_JSON, {
+        qos: 1,
+        retain: true,
+      });
     });
 
+    // The context also has no timestamp, so this is the one case where a
+    // context is present but the publish time has to stand in for it.
     it('publishes to base topic when context has no userSlug', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(MEASURED_AT);
       const exporter = new MqttExporter(defaultConfig);
       await exporter.export(samplePayload, { userName: 'Dad' });
 
-      expect(mockPublishAsync).toHaveBeenCalledWith(
-        'scale/body-composition',
-        JSON.stringify(samplePayload),
-        { qos: 1, retain: true },
-      );
+      expect(fakeMqtt.publishAsync).toHaveBeenCalledWith('scale/body-composition', STATE_JSON, {
+        qos: 1,
+        retain: true,
+      });
     });
   });
 
@@ -104,7 +109,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload, userContext);
 
-      const weightCall = mockPublishAsync.mock.calls.find(
+      const weightCall = fakeMqtt.publishAsync.mock.calls.find(
         (c: unknown[]) => c[0] === 'homeassistant/sensor/ble-scale-sync-dad/weight/config',
       );
       expect(weightCall).toBeDefined();
@@ -118,7 +123,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload, userContext);
 
-      const weightCall = mockPublishAsync.mock.calls.find((c: unknown[]) =>
+      const weightCall = fakeMqtt.publishAsync.mock.calls.find((c: unknown[]) =>
         (c[0] as string).includes('ble-scale-sync-dad/weight/config'),
       );
       const payload = JSON.parse(weightCall![1] as string);
@@ -129,7 +134,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload, userContext);
 
-      const weightCall = mockPublishAsync.mock.calls.find((c: unknown[]) =>
+      const weightCall = fakeMqtt.publishAsync.mock.calls.find((c: unknown[]) =>
         (c[0] as string).includes('ble-scale-sync-dad/weight/config'),
       );
       const payload = JSON.parse(weightCall![1] as string);
@@ -140,7 +145,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload, userContext);
 
-      const weightCall = mockPublishAsync.mock.calls.find((c: unknown[]) =>
+      const weightCall = fakeMqtt.publishAsync.mock.calls.find((c: unknown[]) =>
         (c[0] as string).includes('ble-scale-sync-dad/weight/config'),
       );
       const payload = JSON.parse(weightCall![1] as string);
@@ -151,17 +156,35 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload, userContext);
 
-      const statusCall = mockPublishAsync.mock.calls.find(
+      const statusCall = fakeMqtt.publishAsync.mock.calls.find(
         (c: unknown[]) => c[0] === 'scale/body-composition/dad/status' && c[1] === 'online',
       );
       expect(statusCall).toBeDefined();
+    });
+
+    it("gives each user a timestamp sensor on that user's device", async () => {
+      const exporter = new MqttExporter(haConfig);
+      await exporter.export(samplePayload, userContext);
+
+      const timestampCall = fakeMqtt.publishAsync.mock.calls.find(
+        (c: unknown[]) => c[0] === 'homeassistant/sensor/ble-scale-sync-dad/timestamp/config',
+      );
+      expect(timestampCall).toBeDefined();
+
+      const payload = JSON.parse(timestampCall![1] as string);
+      expect(payload).toMatchObject({
+        unique_id: 'ble-scale-sync-dad_timestamp',
+        state_topic: 'scale/body-composition/dad',
+        availability: [{ topic: 'scale/body-composition/dad/status' }],
+        device: { identifiers: ['ble-scale-sync-dad'], name: 'BLE Scale (Dad)' },
+      });
     });
 
     it('falls back to default device when no context', async () => {
       const exporter = new MqttExporter(haConfig);
       await exporter.export(samplePayload);
 
-      const weightCall = mockPublishAsync.mock.calls.find(
+      const weightCall = fakeMqtt.publishAsync.mock.calls.find(
         (c: unknown[]) => c[0] === 'homeassistant/sensor/ble-scale-sync/weight/config',
       );
       expect(weightCall).toBeDefined();
@@ -181,7 +204,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(config);
       await exporter.export(samplePayload, userContext);
 
-      expect(mockConnectAsync).toHaveBeenCalledWith(
+      expect(fakeMqtt.connect).toHaveBeenCalledWith(
         'mqtt://localhost:1883',
         expect.objectContaining({
           will: {
@@ -199,7 +222,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(config);
       await exporter.export(samplePayload);
 
-      expect(mockConnectAsync).toHaveBeenCalledWith(
+      expect(fakeMqtt.connect).toHaveBeenCalledWith(
         'mqtt://localhost:1883',
         expect.objectContaining({
           will: {
@@ -217,7 +240,7 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(config);
       await exporter.export(samplePayload, userContext);
 
-      const connectOpts = mockConnectAsync.mock.calls[0][1];
+      const connectOpts = fakeMqtt.connect.mock.calls[0][1];
       expect(connectOpts.will).toBeUndefined();
     });
   });
@@ -229,20 +252,16 @@ describe('MqttExporter multi-user', () => {
       const exporter = new MqttExporter(defaultConfig);
 
       await exporter.export(samplePayload, { userName: 'Dad', userSlug: 'dad' });
-      expect(mockPublishAsync).toHaveBeenCalledWith(
+      expect(fakeMqtt.publishAsync).toHaveBeenCalledWith(
         'scale/body-composition/dad',
         expect.any(String),
         expect.any(Object),
       );
 
-      vi.clearAllMocks();
-      mockConnectAsync.mockResolvedValue({
-        publishAsync: mockPublishAsync,
-        endAsync: mockEndAsync,
-      });
+      fakeMqtt.reset();
 
       await exporter.export(samplePayload, { userName: 'Mom', userSlug: 'mom' });
-      expect(mockPublishAsync).toHaveBeenCalledWith(
+      expect(fakeMqtt.publishAsync).toHaveBeenCalledWith(
         'scale/body-composition/mom',
         expect.any(String),
         expect.any(Object),

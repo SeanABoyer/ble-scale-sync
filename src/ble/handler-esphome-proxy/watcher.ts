@@ -5,11 +5,24 @@ import type {
   ScaleAuth,
 } from '../../interfaces/scale-adapter.js';
 import type { EsphomeProxyConfig } from '../../config/schema.js';
-import { type RawReading, waitForRawReading } from '../shared.js';
+import type { RawReading } from '../shared.js';
+import { proxyWatcherPolicy, runGattSession, selectSessionAdapter } from '../session/runner.js';
+import { isHistoricalReading } from '../../interfaces/reading-time.js';
 import { resolveAdapter } from '../../scales/resolve.js';
-import { evaluateAdvertisement, GraceTimers, DedupWindow, logAdvert } from '../advertisement.js';
-import type { Watcher, WatcherConfig } from '../reading-source.js';
-import { bleLog, errMsg, IMPEDANCE_GRACE_MS } from '../types.js';
+import {
+  BoundedMap,
+  evaluateAdvertisement,
+  GraceTimers,
+  DedupWindow,
+  ManufacturerDataCache,
+  PostReadingWindow,
+  logAdvert,
+  safeName,
+  emitDeduped,
+} from '../advertisement.js';
+import { currentProfile } from '../reading-source.js';
+import type { ProfileSource, Watcher, WatcherConfig } from '../reading-source.js';
+import { bleLog, errMsg, IMPEDANCE_GRACE_MS, POST_READING_RECONNECT_MS } from '../types.js';
 import { AsyncQueue } from '../async-queue.js';
 import { EsphomeProxyPool } from './pool.js';
 import { logTransportCapabilities } from './scan.js';
@@ -17,9 +30,23 @@ import { logTransportCapabilities } from './scan.js';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEDUP_WINDOW_MS = 30_000;
-// Cap for the "already warned about this scale's GATT failure" tracker. Old
-// entries are evicted LRU-style so dedup persists long-term in continuous mode.
-const GATT_WARN_LRU_MAX = 256;
+
+/**
+ * The dedup key part for a GATT session that handed over only stored records:
+ * the newest record's own time. Its `reading` is then that record (shared.ts
+ * promotes it), and keyed on weight alone it would hold the 0.1 kg bucket for
+ * DEDUP_WINDOW_MS, so a live weigh-in of nearly the same weight right after it
+ * (a person who stepped off before the final frame and on again) was dropped
+ * whole, MQTT included. Whether a stored record is a replay is the processor's
+ * call (D064), not this window's. Undefined for a live reading.
+ */
+function storedRecordTime(raw: RawReading): string | undefined {
+  const r = raw.reading;
+  if (!isHistoricalReading(r)) return undefined;
+  const ts = r.timestamp;
+  // fromMemory need not carry a readable stamp (D065).
+  return ts && !Number.isNaN(ts.getTime()) ? ts.toISOString() : 'stored';
+}
 
 // ─── ReadingWatcher (continuous mode) ────────────────────────────────────────
 
@@ -28,20 +55,25 @@ const GATT_WARN_LRU_MAX = 256;
  * pool. Broadcast scales parse from advertisements; GATT scales are connected
  * on demand through the proxy that last saw them and read via the shared
  * waitForRawReading() seam, then disconnected immediately so no proxy slot is
- * held between weigh-ins.
+ * held between weigh-ins. A scale still on after its reading is connected again
+ * on its next advertisement; see PostReadingWindow.
  */
 export class ReadingWatcher implements Watcher {
   private queue = new AsyncQueue<RawReading>();
   private started = false;
   private adapters: ScaleAdapter[];
   private targetMac?: string;
-  private profile?: UserProfile;
+  private profile?: ProfileSource;
   private scaleAuth?: ScaleAuth;
   private config: EsphomeProxyConfig;
   private readonly dedup = new DedupWindow(DEDUP_WINDOW_MS);
+  /** When each scale last gave a reading, to tell its still-on reconnect from a failure (#466). */
+  private readonly postReading = new PostReadingWindow(POST_READING_RECONNECT_MS);
   private pool: EsphomeProxyPool | null = null;
   private unsub: (() => void) | null = null;
   private gattInFlight = new Set<string>();
+  /** Set at start and on every advertisement; the proxy liveness signal (#281). */
+  private lastAdvertAt: number | null = null;
 
   /**
    * Last non-empty local name seen per address, so a later nameless frame from
@@ -63,6 +95,9 @@ export class ReadingWatcher implements Watcher {
   private readonly lastAdvertName = new Map<string, string>();
   private static readonly MAX_CACHED_NAMES = 64;
 
+  /** For the GATT handoff only, never the match (see ManufacturerDataCache). */
+  private readonly mfgCache = new ManufacturerDataCache();
+
   /** Remember a name, and merge the remembered one into a nameless frame. */
   private withCachedName(info: BleDeviceInfo, addrLc: string): BleDeviceInfo {
     if (info.localName) {
@@ -77,19 +112,21 @@ export class ReadingWatcher implements Watcher {
     }
     const cached = this.lastAdvertName.get(addrLc);
     if (!cached) return info;
-    bleLog.debug(`Nameless advertisement for ${addrLc}: using cached name "${cached}"`);
+    bleLog.debug(`Nameless advertisement for ${addrLc}: using cached name "${safeName(cached)}"`);
     return { ...info, localName: cached };
   }
-  // LRU map (insertion-ordered): scales whose on-demand GATT connect failed,
-  // so we warn once instead of on every advertisement.
-  private gattWarnedFor = new Map<string, true>();
+  // LRU map (insertion-ordered): scales whose on-demand GATT read failed since
+  // their last success, so we warn once instead of on every advertisement and
+  // log the repeats at debug. A session that ends inside the post-reading
+  // window (PostReadingWindow) neither fills nor clears it.
+  private gattWarnedFor = new BoundedMap<string, true>(256, 'lru');
   /** Weight-only fallback timer per address; on elapse the held reading is
    *  queued directly (no dedup — matches the prior grace-timer body). */
   private readonly grace = new GraceTimers(IMPEDANCE_GRACE_MS, (address, gr) => {
     bleLog.info(
       `Matched: ${gr.adapter.name} (${address}), weight only, no impedance within ${IMPEDANCE_GRACE_MS / 1000}s`,
     );
-    bleLog.info(`Broadcast reading: ${gr.reading.weight} kg`);
+    bleLog.info(`Reading: ${gr.reading.weight} kg`);
     this.queue.push(gr);
   });
 
@@ -97,7 +134,7 @@ export class ReadingWatcher implements Watcher {
     config: EsphomeProxyConfig,
     adapters: ScaleAdapter[],
     targetMac?: string,
-    profile?: UserProfile,
+    profile?: ProfileSource,
     scaleAuth?: ScaleAuth,
   ) {
     this.config = config;
@@ -114,7 +151,14 @@ export class ReadingWatcher implements Watcher {
       this.pool = new EsphomeProxyPool(this.config);
       await this.pool.start();
       logTransportCapabilities(this.adapters);
-      this.unsub = this.pool.onAdvertisement((info, mac) => this.handleAd(info, mac));
+      // Stamped here rather than inside handleAd, which returns early on a
+      // targetMac mismatch: the transport is proven alive by traffic from ANY
+      // device, and the scale only advertises while somebody is on it (#281).
+      this.lastAdvertAt = Date.now();
+      this.unsub = this.pool.onAdvertisement((info, mac) => {
+        this.lastAdvertAt = Date.now();
+        this.handleAd(info, mac);
+      });
       bleLog.info('ESPHome ReadingWatcher started, listening for advertisements');
     } catch (err) {
       this.started = false;
@@ -127,6 +171,7 @@ export class ReadingWatcher implements Watcher {
     if (!this.started) return;
     await this.teardown();
     this.started = false;
+    this.lastAdvertAt = null;
     bleLog.info('ESPHome ReadingWatcher stopped');
   }
 
@@ -134,11 +179,20 @@ export class ReadingWatcher implements Watcher {
     return this.queue.shift(signal);
   }
 
+  /** Epoch ms of the last advertisement from any device (#281). */
+  lastTransportActivityMs(): number | null {
+    return this.lastAdvertAt;
+  }
+
+  /**
+   * Hot reload. scaleAuth is taken as given, unset included, so removing a PIN
+   * on reload takes effect instead of keeping the old one.
+   */
   updateConfig(config: WatcherConfig): void {
     this.adapters = config.adapters;
     this.targetMac = config.targetMac?.toLowerCase();
     if (config.profile) this.profile = config.profile;
-    if (config.scaleAuth) this.scaleAuth = config.scaleAuth;
+    this.scaleAuth = config.scaleAuth;
   }
 
   private handleAd(rawInfo: BleDeviceInfo, address: string): void {
@@ -146,6 +200,7 @@ export class ReadingWatcher implements Watcher {
     if (this.targetMac && addrLc !== this.targetMac) return;
 
     logAdvert(address, rawInfo);
+    this.mfgCache.remember(rawInfo, addrLc);
     const info = this.withCachedName(rawInfo, addrLc);
     const adapter = resolveAdapter(info, this.adapters);
     if (!adapter) return;
@@ -174,14 +229,13 @@ export class ReadingWatcher implements Watcher {
     }
   }
 
-  private pushDeduped(address: string, raw: RawReading, weight: number): void {
-    if (!this.dedup.shouldEmit(address, weight)) {
-      bleLog.debug(`Dedup skip: ${address}:${weight.toFixed(1)}`);
-      return;
-    }
-    bleLog.info(`Matched: ${raw.adapter.name} (${address})`);
-    bleLog.info(`Reading: ${weight} kg`);
-    this.queue.push(raw);
+  private pushDeduped(
+    address: string,
+    raw: RawReading,
+    weight: number,
+    recordTime?: string,
+  ): boolean {
+    return emitDeduped(this.dedup, this.queue, address, raw, weight, recordTime);
   }
 
   private readViaGatt(
@@ -194,7 +248,11 @@ export class ReadingWatcher implements Watcher {
     if (!this.pool) return;
     const pool = this.pool;
     this.gattInFlight.add(addrLc);
+    // Asked now, not in the catch: the session can run for 90 s, and what
+    // matters is whether it opened as the reconnect to a scale still on (#466).
+    const sinceReading = this.postReading.sinceReading(addrLc);
     bleLog.info(`Matched: ${adapter.name} (${address}); opening GATT via ESPHome proxy`);
+    const manufacturerData = this.mfgCache.forSession(info, addrLc);
     void (async () => {
       let session: Awaited<ReturnType<typeof pool.connectGatt>> | null = null;
       // Adapter that actually drives the read; may be re-resolved below once the
@@ -210,28 +268,59 @@ export class ReadingWatcher implements Watcher {
         // the correct char-specific one. On a Eufy P1 "T9147" (fff1 + fff4, no
         // fff2) Inlife matched then failed writing fff2; with the discovered
         // chars, Inlife rejects (no fff2) and 1byone (Eufy) wins on fff4 (#251).
-        const discovered = { ...info, characteristicUuids: [...session.charMap.keys()] };
-        logAdvert(address, discovered);
-        gattAdapter = resolveAdapter(discovered, this.adapters) ?? adapter;
-        if (gattAdapter.name !== adapter.name) {
-          bleLog.info(
-            `Re-resolved adapter after GATT discovery: ${adapter.name} -> ${gattAdapter.name} (${address})`,
-          );
-        }
-        const raw = await waitForRawReading(
-          session.charMap,
-          session.device,
-          gattAdapter,
-          this.profile ?? { height: 170, age: 30, gender: 'male', isAthlete: false },
-          address.replace(/[:-]/g, '').toUpperCase(),
-          undefined,
-          undefined,
-          this.scaleAuth,
+        // resolveAfterDiscovery keeps a pick the advertised name made over an
+        // adapter that claims on a characteristic alone (a Digoo is not Inlife).
+        const characteristicUuids = [...session.charMap.keys()];
+        logAdvert(address, { ...info, characteristicUuids });
+        gattAdapter = selectSessionAdapter(info, { characteristicUuids }, this.adapters, {
+          advertisedPick: adapter,
+          address,
+        })!;
+        // Per session, not once at startup: the processor moves the weight
+        // anchor after every export and QN/R-MSC04 write it to the scale (#331).
+        const sessionProfile: UserProfile = currentProfile(this.profile) ?? {
+          height: 170,
+          age: 30,
+          gender: 'male',
+          isAthlete: false,
+        };
+        const raw = await runGattSession(
+          {
+            charMap: session.charMap,
+            device: session.device,
+            adapter: gattAdapter,
+            profile: sessionProfile,
+            address: address.replace(/[:-]/g, '').toUpperCase(),
+            scaleAuth: this.scaleAuth,
+            deviceName: info.localName,
+            manufacturerData,
+          },
+          proxyWatcherPolicy(address),
         );
-        this.pushDeduped(address, raw, raw.reading.weight);
+        // A read that works again makes the next failure outside the
+        // post-reading window news, so it warns.
+        this.gattWarnedFor.delete(address);
+        this.postReading.noteReading(addrLc);
+        this.pushDeduped(address, raw, raw.reading.weight, storedRecordTime(raw));
       } catch (e) {
-        this.warnGattFailure(gattAdapter.name, address, errMsg(e));
+        if (sinceReading !== undefined) {
+          // Opened while the scale was still on after its last reading, and nobody
+          // stepped on again (#466). Not a failure, so gattWarnedFor stays as it
+          // is: the next real one must still warn.
+          this.postReading.reportNoWeighIn(
+            addrLc,
+            `${gattAdapter.name} at ${address}`,
+            sinceReading,
+            errMsg(e),
+          );
+        } else {
+          this.warnGattFailure(gattAdapter.name, address, errMsg(e));
+        }
       } finally {
+        // Before close(), so the wait is finished with the session before
+        // the session goes away. See fireDisconnect's own doc for why the order
+        // is not load-bearing either way.
+        session?.device.fireDisconnect();
         if (session) await session.close();
         this.gattInFlight.delete(addrLc);
       }
@@ -239,16 +328,15 @@ export class ReadingWatcher implements Watcher {
   }
 
   private warnGattFailure(adapterName: string, address: string, reason: string): void {
-    if (this.gattWarnedFor.has(address)) {
-      this.gattWarnedFor.delete(address);
-      this.gattWarnedFor.set(address, true);
+    const repeat = this.gattWarnedFor.has(address);
+    this.gattWarnedFor.set(address, true);
+    if (repeat) {
+      // Not silent: the reason can change after the first warning (a transient
+      // failure, then a scale that breaks for good), and without this line a
+      // DEBUG log shows nothing a reporter could send (B-13).
+      bleLog.debug(`${adapterName} at ${address}: GATT read failed again (${reason})`);
       return;
     }
-    if (this.gattWarnedFor.size >= GATT_WARN_LRU_MAX) {
-      const oldest = this.gattWarnedFor.keys().next().value;
-      if (oldest !== undefined) this.gattWarnedFor.delete(oldest);
-    }
-    this.gattWarnedFor.set(address, true);
     bleLog.warn(
       `${adapterName} at ${address}: GATT read over the ESPHome proxy failed (${reason}). ` +
         `Will retry on the next advertisement.`,

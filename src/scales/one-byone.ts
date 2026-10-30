@@ -3,12 +3,13 @@ import type {
   ConnectionContext,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
   Unlockable,
   ScaleReading,
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { uuid16, buildPayload, xorChecksum, type ScaleBodyComp } from './body-comp-helpers.js';
+import { uuid16, xorChecksum, WEIGHT_ONLY_HOLD_MS, biaPayload } from './body-comp-helpers.js';
 import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
 
 /**
@@ -22,6 +23,18 @@ import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
 const WEIGHT_STABLE_HOLD_MS = 3000;
 
 // ─── OneByoneAdapter (Eufy C1/P1, Health Scale) ─────────────────────────────
+
+/**
+ * One weigh-in's state, replaced in onConnected rather than onSessionStart.
+ * Safe only for a legacy single-char adapter: shared.ts runs its subscribe and
+ * onConnected under one Promise.all, so the synchronous prefix wins the race.
+ */
+class OneByoneSession {
+  /** Raw weight (hundredths of kg) of the previous frame this session. */
+  previousRawWeight: number | null = null;
+  /** True once two consecutive frames reported the same weight. */
+  weightStable = false;
+}
 
 /**
  * Adapter for Eufy C1/P1/A1 and "Health Scale" branded 1byone devices.
@@ -42,12 +55,8 @@ export class OneByoneAdapter implements ScaleAdapterCore, GattWiring {
   };
   readonly charNotifyUuid = uuid16(0xfff4);
   readonly charWriteUuid = uuid16(0xfff1);
-  readonly normalizesWeight = true;
 
-  /** Raw weight (hundredths of kg) of the previous frame this session. */
-  private previousRawWeight: number | null = null;
-  /** True once two consecutive frames reported the same weight. */
-  private weightStable = false;
+  private s = new OneByoneSession();
 
   matches(device: BleDeviceInfo): boolean {
     // Name match is unambiguous (T914x / Health Scale); keep it.
@@ -71,8 +80,7 @@ export class OneByoneAdapter implements ScaleAdapterCore, GattWiring {
    *   2. Clock sync: [0xF1, yearHi, yearLo, month, day, hour, min, sec]
    */
   async onConnected(ctx: ConnectionContext): Promise<void> {
-    this.previousRawWeight = null;
-    this.weightStable = false;
+    this.s = new OneByoneSession();
 
     // Step 1: Mode/unit command
     const unitCmd = [0xfd, 0x37, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -109,8 +117,8 @@ export class OneByoneAdapter implements ScaleAdapterCore, GattWiring {
       }
     }
 
-    this.weightStable = this.previousRawWeight === rawWeight;
-    this.previousRawWeight = rawWeight;
+    this.s.weightStable = this.s.previousRawWeight === rawWeight;
+    this.s.previousRawWeight = rawWeight;
 
     return { weight, impedance };
   }
@@ -127,16 +135,30 @@ export class OneByoneAdapter implements ScaleAdapterCore, GattWiring {
 
   /** Resolve immediately once the weight has stabilized across two frames. */
   isFinal(_reading: ScaleReading): boolean {
-    return this.weightStable;
+    return this.s.weightStable;
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const comp: ScaleBodyComp = {};
-    return buildPayload(reading.weight, reading.impedance, comp, profile);
+    // buildPayload does NOT run the BIA estimator: without a fat percentage it
+    // falls back to the Deurenberg BMI estimate, so an adapter that parses an
+    // impedance and then passes an empty comp publishes the impedance and
+    // ignores it (#386). biaFatIfPlausible bounds the value first, because the
+    // scaling of this field has never been checked against a capture.
+    // It earns its keep here more than anywhere: this adapter multiplies the
+    // raw field by 0.1 on the strength of an openScale port, so if that factor
+    // is wrong a real 300-900 ohm body arrives as 30-90 and is refused, which
+    // leaves the reading exactly where it was before this change.
+    return biaPayload(reading, profile);
   }
 }
 
 // ─── OneByoneNewAdapter (1byone scale — newer protocol) ─────────────────────
+
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class OneByoneNewSession {
+  cachedWeight = 0;
+  cachedImpedance = 0;
+}
 
 /**
  * Adapter for the newer "1byone scale" branded device.
@@ -148,7 +170,9 @@ export class OneByoneAdapter implements ScaleAdapterCore, GattWiring {
  *     0x01 = impedance: bytes [4-5] big-endian uint16.
  *     0x00 with byte[7]=0x80 = history (ignored).
  */
-export class OneByoneNewAdapter implements ScaleAdapterCore, GattWiring, Unlockable {
+export class OneByoneNewAdapter
+  implements ScaleAdapterCore, GattWiring, Unlockable, HoldForComposition
+{
   readonly name = '1byone Scale (new)';
   readonly match: MatchDescriptor = {
     priority: 60,
@@ -156,15 +180,17 @@ export class OneByoneNewAdapter implements ScaleAdapterCore, GattWiring, Unlocka
   };
   readonly charNotifyUuid = uuid16(0xffb2);
   readonly charWriteUuid = uuid16(0xffb1);
-  readonly normalizesWeight = true;
   readonly unlockCommand = [
     0xab, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0xd7,
   ];
   readonly unlockIntervalMs = 0;
 
-  private cachedWeight = 0;
-  private cachedImpedance = 0;
+  private s = new OneByoneNewSession();
+
+  onSessionStart(): void {
+    this.s = new OneByoneNewSession();
+  }
 
   matches(device: BleDeviceInfo): boolean {
     return matchesDescriptor(device, this.match);
@@ -178,26 +204,46 @@ export class OneByoneNewAdapter implements ScaleAdapterCore, GattWiring, Unlocka
     if (type === 0x80 && data.length >= 6) {
       // Final weight frame: 24-bit BE at [3-5], mask lower 18 bits
       const raw24 = (data[3] << 16) | (data[4] << 8) | data[5];
-      this.cachedWeight = (raw24 & 0x03ffff) / 1000;
+      this.s.cachedWeight = (raw24 & 0x03ffff) / 1000;
     } else if (type === 0x01 && data.length >= 6) {
       // Impedance frame: BE uint16 at [4-5]
-      this.cachedImpedance = (data[4] << 8) | data[5];
+      this.s.cachedImpedance = (data[4] << 8) | data[5];
     } else if (type === 0x00 && data.length >= 8 && data[7] === 0x80) {
       // History frame — ignored
       return null;
     }
 
-    if (this.cachedWeight <= 0) return null;
+    if (this.s.cachedWeight <= 0) return null;
 
-    return { weight: this.cachedWeight, impedance: this.cachedImpedance };
+    return { weight: this.s.cachedWeight, impedance: this.s.cachedImpedance };
   }
 
+  /**
+   * The 0x80 final weight completes the reading; the 0x01 impedance makes it
+   * final (ADR D028, review D-07).
+   *
+   * Requiring the impedance here meant a weigh-in the scale could not analyse
+   * (socks, a child), whose final weight is never followed by a 0x01 frame,
+   * produced no reading at all: the session timed out and the weight was lost.
+   * Now it holds the link for `WEIGHT_ONLY_HOLD_MS`, resolves at once when the
+   * impedance arrives, and otherwise completes with the weight alone.
+   */
   isComplete(reading: ScaleReading): boolean {
-    return reading.weight > 0 && reading.impedance > 0;
+    return reading.weight > 0;
+  }
+
+  readonly completionHoldMs = WEIGHT_ONLY_HOLD_MS;
+
+  isFinal(reading: ScaleReading): boolean {
+    return reading.impedance > 0;
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const comp: ScaleBodyComp = {};
-    return buildPayload(reading.weight, reading.impedance, comp, profile);
+    // buildPayload does NOT run the BIA estimator: without a fat percentage it
+    // falls back to the Deurenberg BMI estimate, so an adapter that parses an
+    // impedance and then passes an empty comp publishes the impedance and
+    // ignores it (#386). biaFatIfPlausible bounds the value first, because the
+    // scaling of this field has never been checked against a capture.
+    return biaPayload(reading, profile);
   }
 }

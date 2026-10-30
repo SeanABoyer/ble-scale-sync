@@ -1,8 +1,12 @@
-import { computeBiaFat, buildPayload, uuid16 } from './body-comp-helpers.js';
+import { buildPayload, uuid16, biaPayload } from './body-comp-helpers.js';
+import { SigMeasurementPairing } from './sig-bcs.js';
 import type {
   BleDeviceInfo,
+  CharacteristicBinding,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
+  MultiCharNotify,
   Unlockable,
   ScaleReading,
   UserProfile,
@@ -10,28 +14,45 @@ import type {
 } from '../interfaces/scale-adapter.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 import { isGenericExcludedName } from './derived-excludes.js';
+import { normalizeUuid } from '../ble/types.js';
 
 // Standard BT SIG characteristic UUIDs
 const CHR_BODY_COMP_MEAS = uuid16(0x2a9c);
+const CHR_WEIGHT_MEAS = uuid16(0x2a9d);
 const CHR_USER_CONTROL_POINT = uuid16(0x2a9f);
 
 // Service short-form UUIDs (as noble may advertise them)
 const SVC_BODY_COMP_SHORT = '181b';
 const SVC_WEIGHT_SHORT = '181d';
 
+/**
+ * How long a 0x2A9D weight waits for the 0x2A9C that may follow it. A scale
+ * with the Weight Scale service alone never sends one, so its weigh-in resolves
+ * when this runs out (or when it disconnects, whichever is first).
+ */
+const BCS_WAIT_MS = 5000;
+
 /** Known brand / model substrings for standard-GATT body-composition scales.
  *  Only models NOT handled by specific adapters should be listed here.
- *  BF720 / BF105 / BF500 / BF788 / BF950 are SIG consent+bond scales owned by
- *  BeurerBf720Adapter, so they are deliberately absent: matches() bails on
- *  isGenericExcludedName() before this list is consulted, which made listing
- *  them both dead and self-contradictory (#229, #255). */
-const KNOWN_NAMES = ['beurer', 'silvercrest', 'bf600', 'bf850', 'medisana'];
-
-interface CachedGattData {
-  bodyFatPercent: number;
-  musclePct?: number;
-  waterMassKg?: number;
-}
+ *  BF720 / BF105 / BF500 / BF788 / BF950 / BF915 are SIG consent+bond scales
+ *  owned by BeurerBf720Adapter, so they are deliberately absent: matches()
+ *  bails on isGenericExcludedName() before this list is consulted, which made
+ *  listing them both dead and self-contradictory (#229, #255). */
+// bf1000, sbf76 and sbf77 come from openScale's standard Beurer/Sanitas
+// handler (#409). They are SIG-profile models with no adapter of their own, so
+// without a name they were reachable only through the generic 0x181B/0x181D
+// service claim. sbf70 and sbf75 are deliberately absent: those are the custom
+// FFE1 protocol and belong to beurer-sanitas.ts.
+const KNOWN_NAMES = [
+  'beurer',
+  'silvercrest',
+  'bf600',
+  'bf850',
+  'bf1000',
+  'sbf76',
+  'sbf77',
+  'medisana',
+];
 
 /**
  * Adapter for scales implementing the standard Bluetooth SIG
@@ -40,28 +61,50 @@ interface CachedGattData {
  * Covers: Beurer, Sanitas, Silvercrest, Digoo, 1byone, Medisana, and other
  * BCS/WSS-compliant scales.
  *
- * Subscribes to the Body Composition Measurement characteristic (0x2A9C).
- * Parses the standard GATT flags for unit detection, body fat, impedance,
- * weight, water mass, and muscle percentage.
+ * Subscribes to Weight Measurement (0x2A9D) and Body Composition Measurement
+ * (0x2A9C), each when the device has it, and pairs them into one weigh-in (see
+ * SigMeasurementPairing). The weight is mandatory only in 0x2A9D, so reading
+ * 0x2A9C alone left a Weight Scale only device, and one that sends its weight
+ * there and only the fat in 0x2A9C, without a reading at all (review C-05).
+ *
+ * Every binding is optional because no single characteristic is common to all
+ * of them. The cost is that a GATT discovery race hiding them all is no longer
+ * reported as missing characteristics: the session then waits out its timeout
+ * and the next cycle reconnects.
  */
-export class StandardGattScaleAdapter implements ScaleAdapterCore, GattWiring, Unlockable {
+export class StandardGattScaleAdapter
+  implements ScaleAdapterCore, GattWiring, MultiCharNotify, HoldForComposition, Unlockable
+{
   readonly name = 'Standard GATT (BCS/WSS)';
   readonly match: MatchDescriptor = {
     priority: 0,
     custom: true,
+    // Derived from KNOWN_NAMES so the descriptor cannot drift from matches()
+    // again (it missed the #409 names). Informational only: the descriptor is
+    // custom, and genericExcludes() skips priority 0.
     names: {
-      includes: ['beurer', 'silvercrest', 'bf600', 'bf850', 'medisana'],
+      includes: [...KNOWN_NAMES],
     },
     serviceUuids: ['181b', '181d'],
   };
   readonly charNotifyUuid = CHR_BODY_COMP_MEAS;
   readonly charWriteUuid = CHR_USER_CONTROL_POINT;
-  readonly normalizesWeight = true;
+  readonly characteristics: CharacteristicBinding[] = [
+    { uuid: CHR_WEIGHT_MEAS, type: 'notify', optional: true },
+    { uuid: CHR_BODY_COMP_MEAS, type: 'notify', optional: true },
+    { uuid: CHR_USER_CONTROL_POINT, type: 'write', optional: true },
+  ];
+  readonly completionHoldMs = BCS_WAIT_MS;
   /** UCP Consent opcode for user index 1 with consent code 0. */
   readonly unlockCommand = [0x02, 0x01, 0x00, 0x00];
   readonly unlockIntervalMs = 5000;
 
-  private cachedGatt: CachedGattData | null = null;
+  /**
+   * Pairs 0x2A9D with 0x2A9C and pins the scale's composition to the reading it
+   * was measured with (#394): this adapter is a shared singleton and
+   * `computeMetrics()` runs later than the parse.
+   */
+  private readonly sig = new SigMeasurementPairing();
 
   matches(device: BleDeviceInfo): boolean {
     const name = (device.localName || '').toLowerCase();
@@ -75,122 +118,66 @@ export class StandardGattScaleAdapter implements ScaleAdapterCore, GattWiring, U
     return KNOWN_NAMES.some((n) => name.includes(n));
   }
 
+  parseCharNotification(charUuid: string, data: Buffer): ScaleReading | null {
+    const uuid = normalizeUuid(charUuid);
+    if (uuid === CHR_WEIGHT_MEAS) return this.sig.onWeight(data);
+    if (uuid === CHR_BODY_COMP_MEAS) return this.sig.onBodyComposition(data);
+    return null;
+  }
+
   /**
-   * Parse a BT SIG Body Composition Measurement (0x2A9C) notification.
-   *
-   * Layout (per Bluetooth GATT specification):
-   *   Bytes 0-1 : Flags (uint16 LE)
-   *   Bytes 2-3 : Body Fat Percentage (uint16 LE, resolution 0.1 %)
-   *   Then optional fields governed by flag bits.
+   * Parse a BT SIG Body Composition Measurement (0x2A9C) notification, for a
+   * caller that has no characteristic to name.
    */
   parseNotification(data: Buffer): ScaleReading | null {
-    if (data.length < 4) return null;
-
-    let offset = 0;
-    const flags = data.readUInt16LE(offset);
-    offset += 2;
-
-    const isKg = (flags & 0x0001) === 0;
-    const tsPresent = (flags & 0x0002) !== 0;
-    const userPresent = (flags & 0x0004) !== 0;
-    const bmrPresent = (flags & 0x0008) !== 0;
-    const musclePctPresent = (flags & 0x0010) !== 0;
-    const muscleMassPresent = (flags & 0x0020) !== 0;
-    const fatFreeMassPresent = (flags & 0x0040) !== 0;
-    const softLeanPresent = (flags & 0x0080) !== 0;
-    const waterMassPresent = (flags & 0x0100) !== 0;
-    const impedancePresent = (flags & 0x0200) !== 0;
-    const weightPresent = (flags & 0x0400) !== 0;
-    const heightPresent = (flags & 0x0800) !== 0;
-
-    const massMultiplier = isKg ? 0.005 : 0.01;
-
-    // Body Fat Percentage — mandatory field
-    if (offset + 2 > data.length) return null;
-    const bodyFatPct = data.readUInt16LE(offset) * 0.1;
-    offset += 2;
-
-    // Timestamp (7 bytes)
-    if (tsPresent) offset += 7;
-
-    // User Index
-    if (userPresent) offset += 1;
-
-    // Basal Metabolism (kJ)
-    if (bmrPresent) offset += 2;
-
-    // Muscle Percentage
-    let musclePct: number | undefined;
-    if (musclePctPresent && offset + 2 <= data.length) {
-      musclePct = data.readUInt16LE(offset) * 0.1;
-      offset += 2;
-    }
-
-    // Muscle Mass
-    if (muscleMassPresent && offset + 2 <= data.length) offset += 2;
-
-    // Fat Free Mass
-    if (fatFreeMassPresent && offset + 2 <= data.length) offset += 2;
-
-    // Soft Lean Mass
-    if (softLeanPresent && offset + 2 <= data.length) offset += 2;
-
-    // Body Water Mass
-    let waterMassKg: number | undefined;
-    if (waterMassPresent && offset + 2 <= data.length) {
-      const raw = data.readUInt16LE(offset) * massMultiplier;
-      offset += 2;
-      waterMassKg = isKg ? raw : raw * 0.453592;
-    }
-
-    // Impedance (resolution 0.1 Ohm)
-    let impedance = 0;
-    if (impedancePresent && offset + 2 <= data.length) {
-      impedance = data.readUInt16LE(offset) * 0.1;
-      offset += 2;
-    }
-
-    // Weight
-    let weight = 0;
-    if (weightPresent && offset + 2 <= data.length) {
-      const rawW = data.readUInt16LE(offset) * massMultiplier;
-      offset += 2;
-      weight = isKg ? rawW : rawW * 0.453592;
-    }
-
-    if (heightPresent && offset + 2 <= data.length) offset += 2;
-
-    this.cachedGatt = { bodyFatPercent: bodyFatPct, musclePct, waterMassKg };
-    return { weight, impedance };
+    return this.sig.onBodyComposition(data);
   }
 
   isComplete(reading: ScaleReading): boolean {
     return reading.weight > 0;
   }
 
+  /** A 0x2A9C reading is the whole weigh-in; a 0x2A9D one waits for it. */
+  isFinal(reading: ScaleReading): boolean {
+    return this.sig.isFinal(reading);
+  }
+
+  /**
+   * Clear the previous weigh-in before anything is subscribed (#394).
+   *
+   * The pin is what fixes the real leak. This reset covers the OTHER path: a
+   * reading built outside the parsers (a direct caller, a test) has nothing
+   * pinned, so computeMetrics falls back to the latest composition, which must
+   * not still hold the previous person's numbers, and a 0x2A9C must not close a
+   * 0x2A9D of the previous session.
+   */
+  onSessionStart(): void {
+    this.sig.reset();
+  }
+
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    // When impedance is available, use the full BIA-based calculation
-    if (reading.impedance > 0) {
-      const fat = computeBiaFat(reading.weight, reading.impedance, profile);
-      return buildPayload(reading.weight, reading.impedance, { fat }, profile);
+    // The scale's own composition wins whenever it measured one (review C-09):
+    // it used to be thrown away for our BIA estimate as soon as the impedance
+    // was plausible, so the fat in Garmin did not match the scale's display.
+    // buildPayload judges it as a whole (D028) and falls back to BIA from the
+    // same impedance, or the BMI estimate, when it is not a body.
+    const gatt = this.sig.compositionOf(reading);
+    if (gatt?.bodyFatPercent !== undefined) {
+      const water =
+        gatt.waterMassKg !== undefined && reading.weight > 0
+          ? (gatt.waterMassKg / reading.weight) * 100
+          : undefined;
+      return buildPayload(
+        reading.weight,
+        reading.impedance,
+        { fat: gatt.bodyFatPercent, water, muscle: gatt.musclePct },
+        profile,
+      );
     }
 
-    // Fallback: derive metrics from GATT body-fat + profile estimations
-    const gatt = this.cachedGatt;
-    const waterPercent =
-      gatt?.waterMassKg && reading.weight > 0
-        ? (gatt.waterMassKg / reading.weight) * 100
-        : undefined;
-
-    return buildPayload(
-      reading.weight,
-      reading.impedance,
-      {
-        fat: gatt?.bodyFatPercent && gatt.bodyFatPercent > 0 ? gatt.bodyFatPercent : undefined,
-        water: waterPercent,
-        muscle: gatt?.musclePct,
-      },
-      profile,
-    );
+    // No fat from the scale. Water or muscle without the fat they were measured
+    // with are not used (D028); BIA from a plausible impedance, else the BMI
+    // estimate. An impedance of 0 never reaches a formula.
+    return biaPayload(reading, profile);
   }
 }

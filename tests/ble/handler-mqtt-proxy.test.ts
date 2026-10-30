@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { Mock } from 'vitest';
 import type {
   ScaleAdapter,
   ScaleReading,
@@ -8,7 +9,11 @@ import type {
 } from '../../src/interfaces/scale-adapter.js';
 import type { MqttProxyConfig } from '../../src/config/schema.js';
 import { adapters as realAdapters } from '../../src/scales/index.js';
-import { bleLog } from '../../src/ble/types.js';
+import { applyForcedAdapter } from '../../src/scales/force.js';
+import { bleLog, POST_READING_RECONNECT_MS, SessionTimeoutError } from '../../src/ble/types.js';
+import { bleFailureKind } from '../../src/ble/failure-kind.js';
+import { M1690_PROTOCOL_VERSION_REPLY } from '../helpers/yunmai-m1690.js';
+import { AR003_ADDRESS, AR003_MSD, ar003MqttChars } from '../helpers/renpho-a-r003.js';
 
 // Suppress log output during tests
 vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -19,15 +24,15 @@ vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
 interface MockMqttClient {
   connected: boolean;
-  on: ReturnType<typeof vi.fn>;
-  removeListener: ReturnType<typeof vi.fn>;
-  subscribe: ReturnType<typeof vi.fn>;
-  subscribeAsync: ReturnType<typeof vi.fn>;
-  unsubscribe: ReturnType<typeof vi.fn>;
-  unsubscribeAsync: ReturnType<typeof vi.fn>;
-  publish: ReturnType<typeof vi.fn>;
-  publishAsync: ReturnType<typeof vi.fn>;
-  endAsync: ReturnType<typeof vi.fn>;
+  on: Mock;
+  removeListener: Mock;
+  subscribe: Mock;
+  subscribeAsync: Mock;
+  unsubscribe: Mock;
+  unsubscribeAsync: Mock;
+  publish: Mock;
+  publishAsync: Mock;
+  endAsync: Mock;
   _listeners: Map<string, Array<(topic: string, payload: Buffer) => void>>;
   _simulateMessage: (topic: string, payload: string | Buffer) => void;
 }
@@ -86,6 +91,9 @@ const MQTT_PROXY_CONFIG: MqttProxyConfig = {
   topic_prefix: 'ble-proxy',
   username: null,
   password: null,
+  embedded_broker_port: 1883,
+  embedded_broker_bind: '0.0.0.0',
+  auto_connect: true,
 };
 
 const PREFIX = 'ble-proxy/esp32-test';
@@ -248,7 +256,6 @@ function createDualModeAdapter(name = 'DualScale'): ScaleAdapter {
 // Must import AFTER vi.mock
 const {
   scanAndReadRaw,
-  scanAndRead,
   scanDevices,
   publishConfig,
   publishBeep,
@@ -638,32 +645,6 @@ describe('handler-mqtt-proxy', () => {
     });
   });
 
-  describe('scanAndRead', () => {
-    it('calls computeMetrics on the broadcast reading', async () => {
-      const adapter = createBroadcastAdapter();
-
-      wireBroadcastFlow([
-        {
-          address: 'AA:BB:CC:DD:EE:FF',
-          name: '',
-          rssi: -50,
-          services: [],
-          manufacturer_id: 0xffff,
-          manufacturer_data: mfrHex(7550),
-        },
-      ]);
-
-      const result = await scanAndRead({
-        adapters: [adapter],
-        profile: PROFILE,
-        mqttProxy: MQTT_PROXY_CONFIG,
-      });
-
-      expect(result).toEqual(BODY_COMP);
-      expect(adapter.computeMetrics).toHaveBeenCalledWith({ weight: 75.5, impedance: 0 }, PROFILE);
-    });
-  });
-
   describe('scanDevices', () => {
     it('parses results and matches adapters', async () => {
       const adapter = createBroadcastAdapter();
@@ -818,6 +799,125 @@ describe('handler-mqtt-proxy', () => {
 
       // Should not publish again — same MAC already known
       expect(mockClient.publishAsync).not.toHaveBeenCalled();
+    });
+  });
+
+  // #422: the ESP32 connects to every MAC in `scales`. It has to learn which of
+  // them are read from advertisements, and firmware that predates `passive`
+  // has to be told to stop connecting at all when nothing needs a connection.
+  describe('advertisement-only scales in the ESP32 config (#422)', () => {
+    const configPayloads = (): Array<Record<string, unknown>> =>
+      (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls
+        .filter((c: unknown[]) => c[0] === `${PREFIX}/config`)
+        .map((c: unknown[]) => JSON.parse(c[1] as string) as Record<string, unknown>);
+    const lastConfig = () => configPayloads().at(-1)!;
+
+    it('all passive: lists them and opts out of autoConnect', async () => {
+      await publishConfig(MQTT_PROXY_CONFIG, ['AA:AA:AA:AA:AA:AA'], undefined, [
+        'AA:AA:AA:AA:AA:AA',
+      ]);
+      expect(lastConfig()).toMatchObject({
+        scales: ['AA:AA:AA:AA:AA:AA'],
+        passive: ['AA:AA:AA:AA:AA:AA'],
+        autoConnect: false,
+      });
+    });
+
+    it('mixed: lists the passive subset and keeps autoConnect for the GATT scale', async () => {
+      await publishConfig(
+        MQTT_PROXY_CONFIG,
+        ['AA:AA:AA:AA:AA:AA', 'BB:BB:BB:BB:BB:BB'],
+        [],
+        ['AA:AA:AA:AA:AA:AA'],
+      );
+      const p = lastConfig();
+      expect(p.passive).toEqual(['AA:AA:AA:AA:AA:AA']);
+      expect(p).not.toHaveProperty('autoConnect');
+    });
+
+    it('none passive: sends neither key', async () => {
+      await publishConfig(MQTT_PROXY_CONFIG, ['BB:BB:BB:BB:BB:BB'], undefined, []);
+      const p = lastConfig();
+      expect(p).not.toHaveProperty('passive');
+      expect(p).not.toHaveProperty('autoConnect');
+    });
+
+    it('drops a passive MAC that is not in scales, so it cannot imply all-passive', async () => {
+      await publishConfig(MQTT_PROXY_CONFIG, ['BB:BB:BB:BB:BB:BB'], undefined, [
+        'AA:AA:AA:AA:AA:AA',
+      ]);
+      const p = lastConfig();
+      expect(p).not.toHaveProperty('passive');
+      expect(p).not.toHaveProperty('autoConnect');
+    });
+
+    it('empty scales never counts as all passive', async () => {
+      await publishConfig(MQTT_PROXY_CONFIG, [], undefined, []);
+      expect(lastConfig()).not.toHaveProperty('autoConnect');
+    });
+
+    it('auto_connect false still opts out with a mixed set', async () => {
+      await publishConfig(
+        { ...MQTT_PROXY_CONFIG, auto_connect: false },
+        ['AA:AA:AA:AA:AA:AA', 'BB:BB:BB:BB:BB:BB'],
+        undefined,
+        ['AA:AA:AA:AA:AA:AA'],
+      );
+      expect(lastConfig()).toMatchObject({ autoConnect: false, passive: ['AA:AA:AA:AA:AA:AA'] });
+    });
+
+    it('registerScaleMac with a passive adapter marks a new MAC passive', async () => {
+      await registerScaleMac(
+        MQTT_PROXY_CONFIG,
+        'aa:aa:aa:aa:aa:aa',
+        createPassiveAdapter('complete'),
+      );
+      expect(lastConfig()).toMatchObject({
+        scales: ['AA:AA:AA:AA:AA:AA'],
+        passive: ['AA:AA:AA:AA:AA:AA'],
+        autoConnect: false,
+      });
+    });
+
+    it('registerScaleMac re-publishes a known MAC that turns out to be passive', async () => {
+      await registerScaleMac(MQTT_PROXY_CONFIG, 'AA:AA:AA:AA:AA:AA');
+      expect(configPayloads()).toHaveLength(1);
+      await registerScaleMac(
+        MQTT_PROXY_CONFIG,
+        'AA:AA:AA:AA:AA:AA',
+        createPassiveAdapter('complete'),
+      );
+      expect(configPayloads()).toHaveLength(2);
+      expect(lastConfig()).toMatchObject({ passive: ['AA:AA:AA:AA:AA:AA'], autoConnect: false });
+    });
+
+    it('registerScaleMac does not re-publish when nothing changed', async () => {
+      await registerScaleMac(
+        MQTT_PROXY_CONFIG,
+        'AA:AA:AA:AA:AA:AA',
+        createPassiveAdapter('complete'),
+      );
+      await registerScaleMac(
+        MQTT_PROXY_CONFIG,
+        'AA:AA:AA:AA:AA:AA',
+        createPassiveAdapter('complete'),
+      );
+      // Without an adapter the flag is left alone, so this is not a change either.
+      await registerScaleMac(MQTT_PROXY_CONFIG, 'AA:AA:AA:AA:AA:AA');
+      expect(configPayloads()).toHaveLength(1);
+    });
+
+    it('registerScaleMac clears the flag when a GATT adapter reads the MAC', async () => {
+      await registerScaleMac(
+        MQTT_PROXY_CONFIG,
+        'AA:AA:AA:AA:AA:AA',
+        createPassiveAdapter('complete'),
+      );
+      await registerScaleMac(MQTT_PROXY_CONFIG, 'AA:AA:AA:AA:AA:AA', createGattAdapter());
+      expect(configPayloads()).toHaveLength(2);
+      const p = lastConfig();
+      expect(p).not.toHaveProperty('passive');
+      expect(p).not.toHaveProperty('autoConnect');
     });
   });
 
@@ -1022,6 +1122,54 @@ describe('handler-mqtt-proxy', () => {
   });
 
   describe('ReadingWatcher', () => {
+    // B-16: stop() unsubscribed and dropped its listeners but left the
+    // persistent client it had opened connected. Its socket (or, once the
+    // embedded broker is gone, mqtt.js's reconnect timer) then pinned the event
+    // loop, so every shutdown on this transport waited out the 5 s hard exit.
+    it('ends the persistent MQTT client it opened when stopped', async () => {
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [createBroadcastAdapter()]);
+      await watcher.start();
+      expect(mockClient.endAsync).not.toHaveBeenCalled();
+
+      await watcher.stop();
+      expect(mockClient.endAsync).toHaveBeenCalledTimes(1);
+    });
+
+    // #281: a wedged proxy and a house nobody has weighed in at both park
+    // nextReading() forever. Advertisements are the only thing that tells them
+    // apart, and they have to be counted BEFORE the targetMac filter, because
+    // the scale itself only advertises while somebody is standing on it.
+    it('counts an advertisement from an unrelated device as transport liveness', async () => {
+      const adapter = createBroadcastAdapter();
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter], '11:22:33:44:55:66');
+      await watcher.start();
+      const atStart = watcher.lastTransportActivityMs();
+      expect(atStart).not.toBeNull();
+
+      await new Promise((r) => setTimeout(r, 5));
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          { address: 'AA:BB:CC:DD:EE:FF', name: 'somebody-elses-watch', rssi: -70, services: [] },
+        ]),
+      );
+      expect(watcher.lastTransportActivityMs()!).toBeGreaterThan(atStart!);
+      await watcher.stop();
+      // Cleared on stop, so a restarted watcher is not judged on a stale clock.
+      expect(watcher.lastTransportActivityMs()).toBeNull();
+    });
+
+    it('does not count an empty scan batch as liveness', async () => {
+      const adapter = createBroadcastAdapter();
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter]);
+      await watcher.start();
+      const atStart = watcher.lastTransportActivityMs();
+      await new Promise((r) => setTimeout(r, 5));
+      mockClient._simulateMessage(`${PREFIX}/scan/results`, JSON.stringify([]));
+      expect(watcher.lastTransportActivityMs()).toBe(atStart);
+      await watcher.stop();
+    });
+
     it('start subscribes with QoS 1 and pushes matched readings to queue', async () => {
       const adapter = createBroadcastAdapter();
       const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter]);
@@ -1316,6 +1464,117 @@ describe('handler-mqtt-proxy', () => {
       const payload = JSON.parse(configCalls[0][1] as string);
       // MAC is uppercased to match the ESP32 raw-buffer comparison format.
       expect(payload.scales).toContain('FF:03:00:53:D6:4D');
+      // A GATT scale stays eligible for the autonomous connect it was seeded for.
+      expect(payload).not.toHaveProperty('passive');
+      expect(payload).not.toHaveProperty('autoConnect');
+    });
+
+    it('seeds a forced Mi Scale 2 as advertisement-only from the start (#422)', async () => {
+      const forced = applyForcedAdapter(realAdapters, 'Xiaomi Mi Scale 2');
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, forced, 'b4:56:5d:81:b8:bf', PROFILE);
+      await watcher.start();
+
+      const configCalls = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c: unknown[]) => c[0] === `${PREFIX}/config`,
+      );
+      expect(configCalls).toHaveLength(1);
+      expect(JSON.parse(configCalls[0][1] as string)).toMatchObject({
+        scales: ['B4:56:5D:81:B8:BF'],
+        passive: ['B4:56:5D:81:B8:BF'],
+        autoConnect: false,
+      });
+      await watcher.stop();
+    });
+
+    it('a broadcast reading from a passive adapter registers its MAC as passive (#422)', async () => {
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [createPassiveAdapter('complete')]);
+      await watcher.start();
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          {
+            address: 'AA:BB:CC:DD:EE:FF',
+            name: '',
+            rssi: -50,
+            services: [],
+            service_data: [{ uuid: '0x181b', data: '0102030405' }],
+          },
+        ]),
+      );
+      await watcher.nextReading();
+      await new Promise((r) => setTimeout(r, 10));
+
+      const configCalls = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c: unknown[]) => c[0] === `${PREFIX}/config`,
+      );
+      expect(JSON.parse(configCalls.at(-1)![1] as string)).toMatchObject({
+        scales: ['AA:BB:CC:DD:EE:FF'],
+        passive: ['AA:BB:CC:DD:EE:FF'],
+        autoConnect: false,
+      });
+      await watcher.stop();
+    });
+
+    // A Silvergear AAA006 seeded from scale_mac: the real adapter list is not all
+    // passive, so the seed leaves the flag off and the ESP32 auto-connects on
+    // sight. The scale refuses connections, and the paused scan missed its
+    // settled frame, so no complete reading ever marked it passive.
+    it('marks a seeded scale passive on its first advertisement, before any reading', async () => {
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, realAdapters, 'A0:91:54:A4:C9:0C');
+      await watcher.start();
+      const configs = () =>
+        (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls
+          .filter((c: unknown[]) => c[0] === `${PREFIX}/config`)
+          .map((c: unknown[]) => JSON.parse(c[1] as string) as Record<string, unknown>);
+      expect(configs().at(-1)).not.toHaveProperty('passive');
+
+      // The idle (0 kg) frame: a 'wait' decision, nothing to read yet.
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          {
+            address: 'A0:91:54:A4:C9:0C',
+            name: 'AAA006',
+            rssi: -60,
+            services: ['ffb0'],
+            manufacturer_id: 0xa0ac,
+            manufacturer_data: '0cc9a45491a0a0c8a0a00db5',
+          },
+        ]),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(configs().at(-1)).toMatchObject({
+        scales: ['A0:91:54:A4:C9:0C'],
+        passive: ['A0:91:54:A4:C9:0C'],
+        autoConnect: false,
+      });
+      await watcher.stop();
+    });
+
+    it('does not register an unknown broadcast scale before it produces a reading', async () => {
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, realAdapters);
+      await watcher.start();
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          {
+            address: 'A0:91:54:A4:C9:0C',
+            name: 'AAA006',
+            rssi: -60,
+            services: ['ffb0'],
+            manufacturer_id: 0xa0ac,
+            manufacturer_data: '0cc9a45491a0a0c8a0a00db5',
+          },
+        ]),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+
+      const configCalls = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c: unknown[]) => c[0] === `${PREFIX}/config`,
+      );
+      expect(configCalls).toHaveLength(0);
+      await watcher.stop();
     });
 
     it('does not seed config when no scale_mac is configured', async () => {
@@ -1399,6 +1658,35 @@ describe('handler-mqtt-proxy', () => {
         (c: unknown[]) => c[0] === `${PREFIX}/connect`,
       );
       expect(JSON.parse(connectCalls[0][1] as string).addr_type).toBe(1);
+    });
+
+    // B-18: the single-shot read had no deadline of its own. An ESP32 that drops
+    // off Wi-Fi mid-session sends no `disconnected`, so only the 15 min poll
+    // cycle cap ended the run, and that one abandons rather than cleans up.
+    it('ends a single-shot GATT read the scale never answers, and disconnects', async () => {
+      vi.useFakeTimers();
+      try {
+        wireGattFlow({ skipNotify: true });
+        let outcome: unknown = 'pending';
+        void scanAndReadRaw({
+          adapters: [createGattAdapter()],
+          profile: PROFILE,
+          mqttProxy: MQTT_PROXY_CONFIG,
+          readingTimeoutMs: 5_000,
+        }).then(
+          () => (outcome = 'resolved'),
+          (err: Error) => (outcome = err.message),
+        );
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(outcome).toMatch(/Timed out waiting for a complete scale reading/);
+        const disconnects = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c: unknown[]) => c[0] === `${PREFIX}/disconnect`,
+        );
+        expect(disconnects).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('always disconnects after GATT reading (even on error)', async () => {
@@ -1549,6 +1837,74 @@ describe('handler-mqtt-proxy', () => {
           mqttProxy: MQTT_PROXY_CONFIG,
         }),
       ).rejects.toThrow('ESP32 error: Connection failed: device not found');
+    });
+
+    // Firmware now publishes `error` as JSON with the operation and address it
+    // belongs to. The topic is shared, so an error from an unrelated scan or
+    // another device must not fail this connect, and the message must be
+    // shown as text, not as a JSON blob.
+    it('rejects only on a structured connect error for this address', async () => {
+      const adapter = createGattAdapter();
+
+      mockClient.subscribeAsync = vi.fn(async (topic: string) => {
+        if (topic === `${PREFIX}/status`) {
+          queueMicrotask(() => mockClient._simulateMessage(`${PREFIX}/status`, 'online'));
+        }
+        if (topic === `${PREFIX}/scan/results`) {
+          queueMicrotask(() =>
+            mockClient._simulateMessage(
+              `${PREFIX}/scan/results`,
+              JSON.stringify([
+                {
+                  address: 'AA:BB:CC:DD:EE:FF',
+                  name: 'GattScale',
+                  rssi: -50,
+                  services: [],
+                  addr_type: 0,
+                },
+              ]),
+            ),
+          );
+        }
+        return [];
+      });
+
+      const origPublish = mockClient.publishAsync;
+      mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+        if (topic === `${PREFIX}/connect`) {
+          queueMicrotask(() => {
+            mockClient._simulateMessage(
+              `${PREFIX}/error`,
+              JSON.stringify({ op: 'scan', message: 'scan restart failed' }),
+            );
+            mockClient._simulateMessage(
+              `${PREFIX}/error`,
+              JSON.stringify({
+                op: 'connect',
+                message: 'other device',
+                address: '11:22:33:44:55:66',
+              }),
+            );
+            mockClient._simulateMessage(
+              `${PREFIX}/error`,
+              JSON.stringify({
+                op: 'connect',
+                message: 'device not found',
+                address: 'aa:bb:cc:dd:ee:ff',
+              }),
+            );
+          });
+        }
+        return origPublish(topic, payload);
+      });
+
+      await expect(
+        scanAndReadRaw({
+          adapters: [adapter],
+          profile: PROFILE,
+          mqttProxy: MQTT_PROXY_CONFIG,
+        }),
+      ).rejects.toThrow(/^ESP32 error: device not found$/);
     });
 
     it('broadcast scales still work unchanged (no regression)', async () => {
@@ -1790,6 +2146,69 @@ describe('handler-mqtt-proxy', () => {
       expect(connectCalls).toHaveLength(0);
     });
 
+    // #408 guard: with no cached advertisement the autonomous connect falls back
+    // to the highest-priority adapter whose notify char the device exposes.
+    // The A&D UC-352BLE GATT layout (HEADS-project/ThingML-BLE discovery dump,
+    // every handle the capture in oliexdev/openScale#1505 touches matches) exposes
+    // 0x2A9D, which Renpho ES-WBE28 and the A&D adapter both declare; the
+    // ES-WBE28 must keep winning there, as it did before the A&D adapter.
+    it('keeps the notify-char fallback on Renpho ES-WBE28 for a nameless WSS device (#408)', async () => {
+      const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      vi.spyOn(bleLog, 'error').mockImplementation(() => {});
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], undefined, PROFILE);
+      await watcher.start();
+
+      const chars = [
+        0x2a00, 0x2a01, 0x2a02, 0x2a03, 0x2a04, 0x2a05, 0x2a9d, 0x2a9e, 0x2a08, 0x2a29, 0x2a24,
+        0x2a25, 0x2a27, 0x2a26, 0x2a28, 0x2a23, 0x2a2a, 0x2a19,
+      ]
+        .map((c) => `0000${c.toString(16).padStart(4, '0')}00001000800000805f9b34fb`)
+        .concat('233bf0015a341b6d975c000d5690abe4')
+        .map((uuid) => ({
+          uuid,
+          properties: uuid.startsWith('00002a9d') ? ['indicate'] : ['read'],
+        }));
+      mockClient._simulateMessage(
+        `${PREFIX}/connected`,
+        JSON.stringify({ autonomous: true, address: '5C:31:3E:01:16:6D', chars }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const picked = infoSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.startsWith('Autonomous GATT connect from ESP32:'));
+      expect(picked).toEqual([
+        'Autonomous GATT connect from ESP32: Renpho ES-WBE28 (5C:31:3E:01:16:6D)',
+      ]);
+      await watcher.stop();
+    });
+
+    // #507: the nameless Renpho A-R003 connected with no cached advertisement.
+    // Its 0xFFF2 without 0xFFF4 is Inlife's claim; the family characteristics
+    // keep it on the ES-WBE28 adapter, which reads it.
+    it('picks Renpho ES-WBE28 for the nameless A-R003 on an autonomous connect (#507)', async () => {
+      const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      vi.spyOn(bleLog, 'error').mockImplementation(() => {});
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], undefined, PROFILE);
+      await watcher.start();
+
+      mockClient._simulateMessage(
+        `${PREFIX}/connected`,
+        JSON.stringify({ autonomous: true, address: AR003_ADDRESS, chars: ar003MqttChars() }),
+      );
+      await new Promise((r) => setTimeout(r, 50));
+
+      const picked = infoSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.startsWith('Autonomous GATT connect from ESP32:'));
+      expect(picked).toEqual([
+        `Autonomous GATT connect from ESP32: Renpho ES-WBE28 (${AR003_ADDRESS})`,
+      ]);
+      await watcher.stop();
+    });
+
     it('autonomous session survives a weigh-in that starts near the old fixed deadline', async () => {
       vi.useFakeTimers();
       try {
@@ -1874,6 +2293,236 @@ describe('handler-mqtt-proxy', () => {
       }
     });
 
+    it('releases the ESP32 on the idle timeout when the scale only answers with status frames (#474)', async () => {
+      vi.useFakeTimers();
+      try {
+        // A Yunmai after a weigh-in answers every unlock with a 5-byte 0x05
+        // frame and sends nothing else. The parser here would take 5 bytes as
+        // a weight, so it is stubbed out; only the hook decides (D070).
+        const adapter = {
+          ...createGattAdapter(),
+          parseNotification: vi.fn((): ScaleReading | null => null),
+          isStatusFrame: (_c: string, d: Buffer) => d.length === 5 && d[3] === 0x05,
+        } as ScaleAdapter;
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter], undefined, PROFILE);
+        await watcher.start();
+
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({
+            autonomous: true,
+            address: 'AA:BB:CC:DD:EE:FF',
+            chars: [
+              { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+              { uuid: GATT_WRITE_UUID, properties: ['write'] },
+            ],
+          }),
+        );
+        void watcher.nextReading();
+
+        for (let elapsed = 0; elapsed < 60_000; elapsed += 5_000) {
+          await vi.advanceTimersByTimeAsync(5_000);
+          mockClient._simulateMessage(
+            `${PREFIX}/notify/${GATT_NOTIFY_UUID}`,
+            M1690_PROTOCOL_VERSION_REPLY,
+          );
+        }
+
+        // 61 s after connect: the idle timeout, not the 90 s cap, has released it.
+        await vi.advanceTimersByTimeAsync(1_000);
+        const disconnects = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c: unknown[]) => c[0] === `${PREFIX}/disconnect`,
+        );
+        expect(disconnects).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // B-15: both watcher GATT paths passed `undefined` for scaleAuth, so an
+    // adapter that authenticates in onConnected (the Beurer consent PIN) saw no
+    // PIN on this transport and told the user to set one they had already set.
+    describe('scaleAuth reaches the adapter on both watcher GATT paths (B-15)', () => {
+      const AUTH = { pin: 1234 };
+
+      function authCapturingAdapter(): { adapter: ScaleAdapter; seen: unknown[] } {
+        const seen: unknown[] = [];
+        const adapter = createGattAdapter();
+        adapter.onConnected = vi.fn(async (ctx) => {
+          seen.push(ctx.scaleAuth);
+          await ctx.write(GATT_WRITE_UUID, [0xa5, 0x01]);
+        });
+        return { adapter, seen };
+      }
+
+      function answerWritesWithReading(): void {
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({
+                  chars: [
+                    { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+                    { uuid: GATT_WRITE_UUID, properties: ['write'] },
+                  ],
+                }),
+              ),
+            );
+          }
+          if (topic === `${PREFIX}/write/${GATT_WRITE_UUID}`) {
+            queueMicrotask(() => {
+              const buf = Buffer.alloc(4);
+              buf.writeUInt16LE(8000, 0);
+              buf.writeUInt16LE(450, 2);
+              mockClient._simulateMessage(`${PREFIX}/notify/${GATT_NOTIFY_UUID}`, buf);
+            });
+          }
+          return origPublish(topic, payload);
+        });
+      }
+
+      it('autonomous connect, with the auth given at construction', async () => {
+        const { adapter, seen } = authCapturingAdapter();
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter], undefined, PROFILE, AUTH);
+        await watcher.start();
+        answerWritesWithReading();
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({
+            autonomous: true,
+            address: 'AA:BB:CC:DD:EE:FF',
+            chars: [
+              { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+              { uuid: GATT_WRITE_UUID, properties: ['write'] },
+            ],
+          }),
+        );
+        await watcher.nextReading();
+        expect(seen).toEqual([AUTH]);
+      });
+
+      it('host-initiated connect, with the auth from a config reload', async () => {
+        const { adapter, seen } = authCapturingAdapter();
+        const config = { ...MQTT_PROXY_CONFIG, auto_connect: false };
+        const watcher = new ReadingWatcher(config, [adapter], undefined, PROFILE);
+        watcher.updateConfig({ adapters: [adapter], profile: PROFILE, scaleAuth: AUTH });
+        await watcher.start();
+        answerWritesWithReading();
+        mockClient._simulateMessage(
+          `${PREFIX}/scan/results`,
+          JSON.stringify([
+            { address: 'AA:BB:CC:DD:EE:FF', name: 'GattScale', rssi: -50, services: [] },
+          ]),
+        );
+        await watcher.nextReading();
+        expect(seen).toEqual([AUTH]);
+      });
+    });
+
+    // #331: the processor moves last_known_weight after every export and QN /
+    // R-MSC04 write it to the scale. A profile captured at startup kept the
+    // scale on the startup anchor for as long as the process ran.
+    describe('the user profile is resolved per GATT session on both watcher paths (#331)', () => {
+      function anchorCapturingAdapter(): { adapter: ScaleAdapter; anchors: unknown[] } {
+        const anchors: unknown[] = [];
+        const adapter = createGattAdapter();
+        adapter.onConnected = vi.fn(async (ctx) => {
+          anchors.push(ctx.profile.lastKnownWeight);
+          await ctx.write(GATT_WRITE_UUID, [0xa5, 0x01]);
+        });
+        return { adapter, anchors };
+      }
+
+      function profileSource(): () => UserProfile {
+        const weights = [70, 72.5];
+        return () => ({ ...PROFILE, lastKnownWeight: weights.shift() });
+      }
+
+      // A different weight per session, so the watcher's 30 s dedup keeps both.
+      function answerWritesWithReadings(): void {
+        let centikg = 8000;
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({
+                  chars: [
+                    { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+                    { uuid: GATT_WRITE_UUID, properties: ['write'] },
+                  ],
+                }),
+              ),
+            );
+          }
+          if (topic === `${PREFIX}/write/${GATT_WRITE_UUID}`) {
+            const w = centikg;
+            centikg += 100;
+            queueMicrotask(() => {
+              const buf = Buffer.alloc(4);
+              buf.writeUInt16LE(w, 0);
+              buf.writeUInt16LE(450, 2);
+              mockClient._simulateMessage(`${PREFIX}/notify/${GATT_NOTIFY_UUID}`, buf);
+            });
+          }
+          return origPublish(topic, payload);
+        });
+      }
+
+      const autonomousConnect = (): void =>
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({
+            autonomous: true,
+            address: 'AA:BB:CC:DD:EE:FF',
+            chars: [
+              { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+              { uuid: GATT_WRITE_UUID, properties: ['write'] },
+            ],
+          }),
+        );
+
+      it('autonomous connect', async () => {
+        const { adapter, anchors } = anchorCapturingAdapter();
+        const watcher = new ReadingWatcher(
+          MQTT_PROXY_CONFIG,
+          [adapter],
+          undefined,
+          profileSource(),
+        );
+        await watcher.start();
+        answerWritesWithReadings();
+        autonomousConnect();
+        await watcher.nextReading();
+        autonomousConnect();
+        await watcher.nextReading();
+        expect(anchors).toEqual([70, 72.5]);
+      });
+
+      it('host-initiated connect', async () => {
+        const { adapter, anchors } = anchorCapturingAdapter();
+        const config = { ...MQTT_PROXY_CONFIG, auto_connect: false };
+        const watcher = new ReadingWatcher(config, [adapter], undefined, profileSource());
+        await watcher.start();
+        answerWritesWithReadings();
+        const scan = (): void =>
+          mockClient._simulateMessage(
+            `${PREFIX}/scan/results`,
+            JSON.stringify([
+              { address: 'AA:BB:CC:DD:EE:FF', name: 'GattScale', rssi: -50, services: [] },
+            ]),
+          );
+        scan();
+        await watcher.nextReading();
+        scan();
+        await watcher.nextReading();
+        expect(anchors).toEqual([70, 72.5]);
+      });
+    });
+
     it('ReadingWatcher ignores autonomous connect when no adapter matches', async () => {
       // Adapter only matches by name 'GattScale', but the autonomous connect
       // comes from a different device with no name info.
@@ -1908,6 +2557,426 @@ describe('handler-mqtt-proxy', () => {
       ).mock.calls.filter((c: unknown[]) => c[0] === `${PREFIX}/disconnect`);
       // handleAutonomousConnect: 1 disconnect (no adapter matched) + 1 from finally block
       expect(disconnectCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    // #422: the reporter's Mi Scale 2 was autonomously connected by the ESP32,
+    // driven over GATT, and answered the unlock write with a status echo every
+    // 3 s until the 90 s session cap. It is read from its advertisements on
+    // every other transport and must never be driven over GATT here either.
+    describe('advertisement-read scales are never driven over GATT (#422)', () => {
+      const MI_MAC = 'B4:56:5D:81:B8:BF';
+      const MI_CHAR = '00002a2f0000351221180009af100700';
+      // The reporter's exact 18-entry characteristic list, duplicate 2a04 included.
+      const MI_CHARS = [
+        '00002a2500001000800000805f9b34fb',
+        '00002a2800001000800000805f9b34fb',
+        '00002a2700001000800000805f9b34fb',
+        '00002a2300001000800000805f9b34fb',
+        '00002a5000001000800000805f9b34fb',
+        '00002a0500001000800000805f9b34fb',
+        '00002a0000001000800000805f9b34fb',
+        '00002a0100001000800000805f9b34fb',
+        '00002a0400001000800000805f9b34fb',
+        '00002a2b00001000800000805f9b34fb',
+        '00002a9b00001000800000805f9b34fb',
+        '00002a9c00001000800000805f9b34fb',
+        MI_CHAR,
+        '000015310000351221180009af100700',
+        '000015320000351221180009af100700',
+        '00002a0400001000800000805f9b34fb',
+        '000015420000351221180009af100700',
+        '000015430000351221180009af100700',
+      ].map((uuid) => ({
+        uuid,
+        // The log carries UUIDs only. 2a2f is the char the session wrote to and
+        // got notifications from, so it is modelled as notify+write.
+        properties: uuid === MI_CHAR ? ['notify', 'write'] : ['read'],
+      }));
+
+      const topicsPublished = () =>
+        (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) =>
+          String(c[0]),
+        );
+
+      it('drops the autonomous connect: no handshake, no subscribe, one disconnect', async () => {
+        const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], MI_MAC, PROFILE);
+        await watcher.start();
+        (mockClient.publishAsync as ReturnType<typeof vi.fn>).mockClear();
+
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({ autonomous: true, address: MI_MAC, chars: MI_CHARS }),
+        );
+        await new Promise((r) => setTimeout(r, 50));
+
+        const published = topicsPublished();
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/write/`))).toEqual([]);
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/subscribe/`))).toEqual([]);
+        expect(published.filter((t) => t === `${PREFIX}/disconnect`)).toHaveLength(1);
+        const lines = infoSpy.mock.calls.map((c) => String(c[0]));
+        expect(
+          lines.some((l) =>
+            l.includes(
+              `Autonomous connect to Xiaomi Mi Scale 2 (${MI_MAC}) ignored: this scale is read from its advertisements`,
+            ),
+          ),
+        ).toBe(true);
+        infoSpy.mockRestore();
+        await watcher.stop();
+      });
+
+      it('still delivers the broadcast reading after refusing the connect', async () => {
+        // Passive adapter that also claims the device by its notify char, the
+        // way Mi Scale 2 claims 2a2f after discovery.
+        const adapter = {
+          ...createPassiveAdapter('complete'),
+          charNotifyUuid: GATT_NOTIFY_UUID,
+          charWriteUuid: GATT_WRITE_UUID,
+          unlockCommand: [0x01],
+          unlockIntervalMs: 3000,
+        } as ScaleAdapter;
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter], undefined, PROFILE);
+        await watcher.start();
+
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({
+            autonomous: true,
+            address: 'AA:BB:CC:DD:EE:FF',
+            chars: [
+              { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+              { uuid: GATT_WRITE_UUID, properties: ['write'] },
+            ],
+          }),
+        );
+        await new Promise((r) => setTimeout(r, 20));
+        expect(topicsPublished().filter((t) => t.startsWith(`${PREFIX}/write/`))).toEqual([]);
+
+        mockClient._simulateMessage(
+          `${PREFIX}/scan/results`,
+          JSON.stringify([
+            {
+              address: 'AA:BB:CC:DD:EE:FF',
+              name: '',
+              rssi: -50,
+              services: [],
+              service_data: [{ uuid: '0x181b', data: '0102030405' }],
+            },
+          ]),
+        );
+        const raw = await watcher.nextReading();
+        expect(raw.reading.impedance).toBe(500);
+        await watcher.stop();
+      });
+
+      it('drops a host-initiated session once discovery shows a Mi Scale 2', async () => {
+        const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+        const watcher = new ReadingWatcher(
+          { ...MQTT_PROXY_CONFIG, auto_connect: false },
+          [...realAdapters],
+          undefined,
+          PROFILE,
+        );
+        await watcher.start();
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({ address: MI_MAC, chars: MI_CHARS }),
+              ),
+            );
+          }
+          return origPublish(topic, payload);
+        });
+
+        // A nameless advert carrying only the 0x181B service and no service
+        // data: nothing to parse, so it reaches the GATT decision.
+        mockClient._simulateMessage(
+          `${PREFIX}/scan/results`,
+          JSON.stringify([
+            {
+              address: MI_MAC,
+              name: '',
+              rssi: -60,
+              services: ['0000181b00001000800000805f9b34fb'],
+            },
+          ]),
+        );
+        await new Promise((r) => setTimeout(r, 80));
+
+        const published = topicsPublished();
+        expect(published.filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/write/`))).toEqual([]);
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/subscribe/`))).toEqual([]);
+        expect(published.filter((t) => t === `${PREFIX}/disconnect`)).toHaveLength(1);
+        expect(
+          infoSpy.mock.calls.some((c) =>
+            String(c[0]).includes(
+              `Host-initiated connect to Xiaomi Mi Scale 2 (${MI_MAC}) ignored`,
+            ),
+          ),
+        ).toBe(true);
+        infoSpy.mockRestore();
+        mockClient.publishAsync = origPublish;
+        await watcher.stop();
+      });
+
+      it('drops a single-shot session once discovery shows a Mi Scale 2', async () => {
+        const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+        mockClient.subscribeAsync = vi.fn(async (topic: string) => {
+          if (topic === `${PREFIX}/status`) {
+            queueMicrotask(() => mockClient._simulateMessage(`${PREFIX}/status`, 'online'));
+          }
+          if (topic === `${PREFIX}/scan/results`) {
+            // Nameless, 0x181B only, no service data: it reaches the GATT decision.
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/scan/results`,
+                JSON.stringify([
+                  {
+                    address: MI_MAC,
+                    name: '',
+                    rssi: -60,
+                    services: ['0000181b00001000800000805f9b34fb'],
+                  },
+                ]),
+              ),
+            );
+          }
+          return [];
+        });
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({ address: MI_MAC, chars: MI_CHARS }),
+              ),
+            );
+          }
+          return origPublish(topic, payload);
+        });
+
+        await expect(
+          scanAndReadRaw({
+            adapters: [...realAdapters],
+            profile: PROFILE,
+            mqttProxy: MQTT_PROXY_CONFIG,
+          }),
+        ).rejects.toThrow('is read from its advertisements');
+
+        const published = topicsPublished();
+        expect(published.filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/write/`))).toEqual([]);
+        expect(published.filter((t) => t.startsWith(`${PREFIX}/subscribe/`))).toEqual([]);
+        expect(published.filter((t) => t === `${PREFIX}/disconnect`)).toHaveLength(1);
+        expect(
+          infoSpy.mock.calls.some((c) =>
+            String(c[0]).includes(`Connect to Xiaomi Mi Scale 2 (${MI_MAC}) ignored`),
+          ),
+        ).toBe(true);
+        infoSpy.mockRestore();
+        mockClient.publishAsync = origPublish;
+      });
+
+      it('tells the ESP32 to stop connecting, before it sends the disconnect', async () => {
+        // The reporter's setup: scale_mac seeded as an ordinary scale at start,
+        // so the first weigh-in is the one that teaches the proxy.
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], MI_MAC, PROFILE);
+        await watcher.start();
+        (mockClient.publishAsync as ReturnType<typeof vi.fn>).mockClear();
+
+        mockClient._simulateMessage(
+          `${PREFIX}/connected`,
+          JSON.stringify({ autonomous: true, address: MI_MAC, chars: MI_CHARS }),
+        );
+        await new Promise((r) => setTimeout(r, 50));
+
+        const published = topicsPublished();
+
+        const configIdx = published.indexOf(`${PREFIX}/config`);
+        expect(configIdx).toBeGreaterThanOrEqual(0);
+        expect(configIdx).toBeLessThan(published.indexOf(`${PREFIX}/disconnect`));
+        const call = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls[configIdx];
+        expect(JSON.parse(call[1] as string)).toMatchObject({
+          scales: [MI_MAC],
+          passive: [MI_MAC],
+          autoConnect: false,
+        });
+        await watcher.stop();
+      });
+
+      it('does not reconnect a scale it already refused over GATT', async () => {
+        const watcher = new ReadingWatcher(
+          { ...MQTT_PROXY_CONFIG, auto_connect: false },
+          [...realAdapters],
+          undefined,
+          PROFILE,
+        );
+        await watcher.start();
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({ address: MI_MAC, chars: MI_CHARS }),
+              ),
+            );
+          }
+          return origPublish(topic, payload);
+        });
+        const advert = JSON.stringify([
+          {
+            address: MI_MAC,
+            name: '',
+            rssi: -60,
+            services: ['0000181b00001000800000805f9b34fb'],
+          },
+        ]);
+
+        mockClient._simulateMessage(`${PREFIX}/scan/results`, advert);
+        await new Promise((r) => setTimeout(r, 80));
+        mockClient._simulateMessage(`${PREFIX}/scan/results`, advert);
+        await new Promise((r) => setTimeout(r, 80));
+
+        expect(topicsPublished().filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        mockClient.publishAsync = origPublish;
+        await watcher.stop();
+      });
+
+      it('keeps the GATT session for a standard BCS scale that Mi claimed by its advert', async () => {
+        // Mi Scale 2 claims any bare 0x181B advert before discovery. A BCS scale
+        // is read only through the connect that follows, so the refusal must
+        // look at the post-discovery adapter, never the advertisement-time one.
+        const watcher = new ReadingWatcher(
+          { ...MQTT_PROXY_CONFIG, auto_connect: false },
+          [...realAdapters],
+          undefined,
+          PROFILE,
+        );
+        await watcher.start();
+        const origPublish = mockClient.publishAsync;
+        mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+          if (topic === `${PREFIX}/connect`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/connected`,
+                JSON.stringify({
+                  address: '11:22:33:44:55:66',
+                  chars: [
+                    { uuid: '00002a9c00001000800000805f9b34fb', properties: ['indicate'] },
+                    { uuid: '00002a9d00001000800000805f9b34fb', properties: ['indicate'] },
+                    { uuid: '00002a9f00001000800000805f9b34fb', properties: ['write', 'indicate'] },
+                  ],
+                }),
+              ),
+            );
+          }
+          return origPublish(topic, payload);
+        });
+
+        mockClient._simulateMessage(
+          `${PREFIX}/scan/results`,
+          JSON.stringify([
+            {
+              address: '11:22:33:44:55:66',
+              name: '',
+              rssi: -60,
+              services: ['0000181b00001000800000805f9b34fb'],
+            },
+          ]),
+        );
+        await new Promise((r) => setTimeout(r, 80));
+
+        const published = topicsPublished();
+        expect(published.filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        expect(
+          published.filter((t) => t.startsWith(`${PREFIX}/subscribe/`)).length,
+        ).toBeGreaterThan(0);
+        mockClient.publishAsync = origPublish;
+        await watcher.stop();
+      });
+
+      // An advert marks a known MAC passive only when it shows the scale is the
+      // adapter's. These are standard BCS scales that Mi Scale 2 claims before
+      // discovery, so they must stay connectable.
+      const BCS_MAC = '11:22:33:44:55:66';
+      const BCS_BARE_ADVERT = { address: BCS_MAC, name: '', rssi: -60, services: ['181b'] };
+      const lastConfig = () => {
+        const calls = (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+          (c: unknown[]) => c[0] === `${PREFIX}/config`,
+        );
+        return calls.length ? JSON.parse(calls.at(-1)![1] as string) : undefined;
+      };
+
+      it('still connects a seeded BCS scale that Mi claims by its bare advert', async () => {
+        const watcher = new ReadingWatcher(
+          { ...MQTT_PROXY_CONFIG, auto_connect: false },
+          [...realAdapters],
+          BCS_MAC,
+          PROFILE,
+        );
+        await watcher.start();
+        mockClient._simulateMessage(`${PREFIX}/scan/results`, JSON.stringify([BCS_BARE_ADVERT]));
+        await new Promise((r) => setTimeout(r, 50));
+
+        expect(lastConfig()).not.toHaveProperty('passive');
+        expect(topicsPublished().filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        await watcher.stop();
+      });
+
+      it('does not flip a BCS scale read over GATT to passive on its next advert', async () => {
+        const watcher = new ReadingWatcher(
+          { ...MQTT_PROXY_CONFIG, auto_connect: false },
+          [...realAdapters],
+          undefined,
+          PROFILE,
+        );
+        await watcher.start();
+        // What handleGattReading records after a completed BCS session.
+        const std = realAdapters.find((a) => a.name === 'Standard GATT (BCS/WSS)')!;
+        await registerScaleMac(MQTT_PROXY_CONFIG, BCS_MAC, std);
+        mockClient._simulateMessage(`${PREFIX}/scan/results`, JSON.stringify([BCS_BARE_ADVERT]));
+        await new Promise((r) => setTimeout(r, 50));
+
+        expect(lastConfig()).not.toHaveProperty('passive');
+        expect(topicsPublished().filter((t) => t === `${PREFIX}/connect`)).toHaveLength(1);
+        await watcher.stop();
+      });
+
+      it('does not mark a seeded BCS scale passive on service data Mi cannot parse', async () => {
+        const { toBleDeviceInfo } = await import('../../src/ble/handler-mqtt-proxy/scan.js');
+        const { evaluateAdvertisement } = await import('../../src/ble/advertisement.js');
+        const { resolveAdapter } = await import('../../src/scales/resolve.js');
+        // BCS + WSS, with a WSS measurement as 0x181D service data: the captured
+        // XMTZC04HM frame, without its Huami company id. Mi Scale 2 claims it by
+        // 0x181B and reads any service data as 'wait'.
+        const advert = {
+          address: BCS_MAC,
+          name: '',
+          rssi: -60,
+          services: ['181b', '181d'],
+          service_data: [{ uuid: '181d', data: '238e4eea070818103913' }],
+        };
+        const info = toBleDeviceInfo(advert);
+        const claimed = resolveAdapter(info, realAdapters)!;
+        expect(claimed.name).toBe('Xiaomi Mi Scale 2');
+        expect(evaluateAdvertisement(claimed, info).kind).toBe('wait');
+
+        const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [...realAdapters], BCS_MAC, PROFILE);
+        await watcher.start();
+        mockClient._simulateMessage(`${PREFIX}/scan/results`, JSON.stringify([advert]));
+        await new Promise((r) => setTimeout(r, 50));
+
+        expect(lastConfig()).not.toHaveProperty('passive');
+        expect(lastConfig()).not.toHaveProperty('autoConnect');
+        await watcher.stop();
+      });
     });
 
     it('ReadingWatcher supersedes the in-flight session on a newer autonomous connect (#296)', async () => {
@@ -2198,6 +3267,61 @@ describe('handler-mqtt-proxy', () => {
       await watcher.stop();
     });
 
+    // #507: the nameless Renpho A-R003 over a host-initiated connect. Its
+    // advertisement claims it before connecting, and the characteristics keep
+    // it there instead of Inlife.
+    it('host-initiated GATT drives the nameless A-R003 with Renpho ES-WBE28 (#507)', async () => {
+      const infoSpy = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const renpho = realAdapters.find((a) => a.name === 'Renpho ES-WBE28')!;
+      const onConnected = vi.fn(async () => {});
+      renpho.onConnected = onConnected;
+      const watcher = new ReadingWatcher(
+        { ...MQTT_PROXY_CONFIG, auto_connect: false },
+        [...realAdapters],
+        undefined,
+        PROFILE,
+      );
+      await watcher.start();
+
+      const origPublish = mockClient.publishAsync;
+      mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+        if (topic === `${PREFIX}/connect`) {
+          queueMicrotask(() =>
+            mockClient._simulateMessage(
+              `${PREFIX}/connected`,
+              JSON.stringify({ address: AR003_ADDRESS, chars: ar003MqttChars() }),
+            ),
+          );
+        }
+        return origPublish(topic, payload);
+      });
+
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([
+          {
+            address: AR003_ADDRESS,
+            name: '',
+            rssi: -60,
+            services: ['181d'],
+            manufacturer_id: 0xffff,
+            manufacturer_data: AR003_MSD.toString('hex'),
+          },
+        ]),
+      );
+      await new Promise((r) => setTimeout(r, 80));
+
+      const info = infoSpy.mock.calls.map((c) => String(c[0]));
+      expect(info).toContain(`Connecting via GATT proxy to Renpho ES-WBE28 (${AR003_ADDRESS})...`);
+      expect(info.some((l) => l.includes('Re-resolved adapter after GATT discovery'))).toBe(false);
+      expect(onConnected).toHaveBeenCalledTimes(1);
+      infoSpy.mockRestore();
+      // An own property over the prototype method; deleting it restores the lookup.
+      delete renpho.onConnected;
+      mockClient.publishAsync = origPublish;
+      await watcher.stop();
+    });
+
     it('host-initiated connect ignores autonomous connected payload', async () => {
       // Non-autonomous connected messages (no `autonomous: true`) should not
       // trigger handleAutonomousConnect.
@@ -2433,6 +3557,220 @@ describe('handler-mqtt-proxy', () => {
     });
   });
 
+  /**
+   * #466: after a reading the ESP32 resumes scanning and connects to the scale
+   * again by itself while it is still on (firmware auto-connect), and the host
+   * path connects again on the next scan batch. Nobody steps on, the scale
+   * switches off, and that end used to warn after every weigh-in.
+   */
+  describe('session after a reading (#466, D058)', () => {
+    const MAC = 'AA:BB:CC:DD:EE:FF';
+    const NO_WEIGH_IN =
+      /session opened \d+\.\d s after the last reading, while the scale was still on, ended without a new weigh-in/;
+    const settle = () => new Promise((r) => setTimeout(r, 50));
+    const lines = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.map((c) => String(c[0]));
+    const CHARS = [
+      { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+      { uuid: GATT_WRITE_UUID, properties: ['write'] },
+    ];
+
+    /** Answer a connect command and, while `notify.on`, every write with a reading. */
+    function wireScale(notify: { on: boolean }): void {
+      const origPublish = mockClient.publishAsync;
+      mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+        if (topic === `${PREFIX}/connect`) {
+          queueMicrotask(() =>
+            mockClient._simulateMessage(`${PREFIX}/connected`, JSON.stringify({ chars: CHARS })),
+          );
+        }
+        if (topic === `${PREFIX}/write/${GATT_WRITE_UUID}` && notify.on) {
+          queueMicrotask(() => {
+            const buf = Buffer.alloc(4);
+            buf.writeUInt16LE(9000, 0); // 90.00 kg
+            buf.writeUInt16LE(520, 2); // impedance 520
+            mockClient._simulateMessage(`${PREFIX}/notify/${GATT_NOTIFY_UUID}`, buf);
+          });
+        }
+        return origPublish(topic, payload);
+      });
+    }
+
+    const autonomousConnect = () =>
+      mockClient._simulateMessage(
+        `${PREFIX}/connected`,
+        JSON.stringify({ autonomous: true, address: MAC, chars: CHARS }),
+      );
+
+    const scanBatch = () =>
+      mockClient._simulateMessage(
+        `${PREFIX}/scan/results`,
+        JSON.stringify([{ address: MAC, name: 'GattScale', rssi: -50, services: [] }]),
+      );
+
+    const unlockWrites = () =>
+      (mockClient.publishAsync as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c: unknown[]) => c[0] === `${PREFIX}/write/${GATT_WRITE_UUID}`,
+      ).length;
+
+    it('logs the autonomous reconnect to a scale still on at info, not as a failure', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const info = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const watcher = new ReadingWatcher(
+        MQTT_PROXY_CONFIG,
+        [createGattAdapter()],
+        undefined,
+        PROFILE,
+      );
+      await watcher.start();
+      const notify = { on: true };
+      wireScale(notify);
+
+      autonomousConnect();
+      expect((await watcher.nextReading()).reading.weight).toBe(90);
+      await settle();
+      const writesAfterReading = unlockWrites();
+
+      notify.on = false;
+      autonomousConnect();
+      await settle();
+      // The second session really ran: it wrote its unlock again.
+      expect(unlockWrites()).toBeGreaterThan(writesAfterReading);
+      mockClient._simulateMessage(`${PREFIX}/disconnected`, '');
+      await settle();
+
+      expect(lines(warn).filter((l) => l.includes('Autonomous GATT reading failed'))).toEqual([]);
+      const told = lines(info).filter((l) => NO_WEIGH_IN.test(l));
+      expect(told).toHaveLength(1);
+      expect(told[0]).toContain(`Autonomous GATT reading for ${MAC}: session opened`);
+      expect(told[0]).toContain('(Scale disconnected before reading completed)');
+      await watcher.stop();
+    });
+
+    it('logs the host-initiated reconnect to a scale still on at info, not as a failure', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const info = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const config = { ...MQTT_PROXY_CONFIG, auto_connect: false };
+      const watcher = new ReadingWatcher(config, [createGattAdapter()], undefined, PROFILE);
+      await watcher.start();
+      const notify = { on: true };
+      wireScale(notify);
+
+      scanBatch();
+      expect((await watcher.nextReading()).reading.weight).toBe(90);
+      await settle();
+
+      notify.on = false;
+      scanBatch();
+      await settle();
+      mockClient._simulateMessage(`${PREFIX}/disconnected`, '');
+      await settle();
+
+      expect(lines(warn).filter((l) => l.includes('GATT reading failed for'))).toEqual([]);
+      const told = lines(info).filter((l) => NO_WEIGH_IN.test(l));
+      expect(told).toHaveLength(1);
+      expect(told[0]).toContain(`GATT reading for ${MAC}: session opened`);
+      await watcher.stop();
+    });
+
+    it('still warns, with the same text, for a session opened after the window', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const info = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const t0 = new Date('2026-10-16T08:00:00Z').getTime();
+      vi.setSystemTime(t0);
+      const watcher = new ReadingWatcher(
+        MQTT_PROXY_CONFIG,
+        [createGattAdapter()],
+        undefined,
+        PROFILE,
+      );
+      try {
+        await watcher.start();
+        const notify = { on: true };
+        wireScale(notify);
+
+        autonomousConnect();
+        await watcher.nextReading();
+        await settle();
+
+        vi.setSystemTime(t0 + POST_READING_RECONNECT_MS + 1);
+        notify.on = false;
+        autonomousConnect();
+        await settle();
+        mockClient._simulateMessage(`${PREFIX}/disconnected`, '');
+        await settle();
+
+        expect(lines(warn)).toContain(
+          `Autonomous GATT reading failed for ${MAC}: Scale disconnected before reading completed`,
+        );
+        expect(lines(info).filter((l) => NO_WEIGH_IN.test(l))).toEqual([]);
+        await watcher.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // #474: a Yunmai Mini 2 stays connectable after a weigh-in and the ESP32
+    // connects to it again on every advertisement. Each session ended 60 s
+    // later, so from the second one on every session warned.
+    it('treats the reconnects to a scale that stays on as one window, measured from the reading (#474)', async () => {
+      const warn = vi.spyOn(bleLog, 'warn').mockImplementation(() => {});
+      const info = vi.spyOn(bleLog, 'info').mockImplementation(() => {});
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      const t0 = new Date('2026-10-20T13:34:16Z').getTime();
+      vi.setSystemTime(t0);
+      const watcher = new ReadingWatcher(
+        MQTT_PROXY_CONFIG,
+        [createGattAdapter()],
+        undefined,
+        PROFILE,
+      );
+      try {
+        await watcher.start();
+        const notify = { on: true };
+        wireScale(notify);
+
+        autonomousConnect();
+        await watcher.nextReading();
+        await settle();
+
+        notify.on = false;
+        let end = t0;
+        // Three sessions: the third shows the window follows every one of
+        // them, not only the first.
+        for (const gap of [1000, 2000, 2000]) {
+          vi.setSystemTime(end + gap);
+          autonomousConnect();
+          await settle();
+          end = Date.now() + 60_000;
+          vi.setSystemTime(end);
+          mockClient._simulateMessage(`${PREFIX}/disconnected`, '');
+          await settle();
+        }
+
+        expect(lines(warn).filter((l) => l.includes('Autonomous GATT reading failed'))).toEqual([]);
+        expect(lines(info).filter((l) => NO_WEIGH_IN.test(l))).toHaveLength(1);
+        expect(lines(debug).filter((l) => NO_WEIGH_IN.test(l))).toEqual([
+          expect.stringContaining('session opened 63.0 s after the last reading'),
+          expect.stringContaining('session opened 125.0 s after the last reading'),
+        ]);
+
+        // More than 60 s after the last of them it warns again.
+        vi.setSystemTime(end + POST_READING_RECONNECT_MS + 1);
+        autonomousConnect();
+        await settle();
+        mockClient._simulateMessage(`${PREFIX}/disconnected`, '');
+        await settle();
+        expect(lines(warn)).toContain(
+          `Autonomous GATT reading failed for ${MAC}: Scale disconnected before reading completed`,
+        );
+        await watcher.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe('listener leaks on abnormal teardown', () => {
     it('autonomous session timeout releases the notification listeners', async () => {
       vi.useFakeTimers();
@@ -2467,6 +3805,59 @@ describe('handler-mqtt-proxy', () => {
       }
     });
 
+    it('a start() that fails mid-subscribe leaves no listeners behind (#404)', async () => {
+      const adapter = createGattAdapter();
+
+      const lifecycleCount = () =>
+        (['reconnect', 'offline', 'error', 'connect'] as const).reduce(
+          (n, event) => n + (mockClient._listeners.get(event) ?? []).length,
+          0,
+        );
+      const before = lifecycleCount();
+
+      // A broker that connects and then refuses one subscribe: an ACL denial
+      // looks exactly like this, and start() runs once per loop iteration.
+      mockClient.subscribeAsync = vi.fn(async (topic: string) => {
+        if (topic === `${PREFIX}/connected`) throw new Error('not authorized');
+        return [];
+      });
+
+      const watcher = new ReadingWatcher(MQTT_PROXY_CONFIG, [adapter], undefined, PROFILE);
+      await expect(watcher.start()).rejects.toThrow('not authorized');
+      await expect(watcher.start()).rejects.toThrow('not authorized');
+      await expect(watcher.start()).rejects.toThrow('not authorized');
+
+      // Four handlers per failed start used to stay on the persistent client,
+      // unrecoverable because the next start() reassigned the list holding them.
+      expect(lifecycleCount()).toBe(before);
+      expect((mockClient._listeners.get('message') ?? []).length).toBe(0);
+
+      // The two subscribes that DID take are unsubscribed, once per attempt.
+      const unsubscribed = mockClient.unsubscribeAsync.mock.calls.map((c: unknown[]) => c[0]);
+      expect(unsubscribed).toContain(`${PREFIX}/scan/results`);
+      expect(unsubscribed).toContain(`${PREFIX}/status`);
+      expect(unsubscribed).not.toContain(`${PREFIX}/connected`);
+    });
+
+    it('MqttBleDevice.fireDisconnect runs the session callback exactly once (#404)', async () => {
+      const { MqttBleDevice } = await import('../../src/ble/handler-mqtt-proxy/gatt.js');
+      const { topics } = await import('../../src/ble/handler-mqtt-proxy/topics.js');
+      const t = topics('ble-proxy', 'esp32-test');
+
+      const device = new MqttBleDevice(mockClient as never, t.disconnected);
+      const cb = vi.fn();
+      device.onDisconnect(cb);
+
+      // The abandonment path fires it, and the ESP32's own disconnect frame can
+      // land afterwards. Re-entering a settled session is what the latch stops.
+      device.fireDisconnect();
+      device.fireDisconnect();
+      mockClient._simulateMessage(t.disconnected, '');
+
+      expect(cb).toHaveBeenCalledTimes(1);
+      device.cleanup();
+    });
+
     it('MqttBleChar.subscribe removes its listener when setup fails', async () => {
       const { MqttBleChar } = await import('../../src/ble/handler-mqtt-proxy/gatt.js');
       mockClient.subscribeAsync = vi.fn(async () => {
@@ -2494,3 +3885,203 @@ describe('handler-mqtt-proxy', () => {
     });
   });
 });
+
+// Characterization of the GATT session policy on every mqtt-proxy path (arch
+// wave 2). Single-shot: idle and cap from readingTimeoutMs, a hold moves the
+// cap, the abort signal does not end the session. Watcher (host and
+// autonomous): 60 s idle and a 90 s cap a hold does not move, which hands the
+// held weight over instead.
+describe('mqtt-proxy GATT session policy', () => {
+  const MAC = 'AA:BB:CC:DD:EE:FF';
+  const CHARS = [
+    { uuid: GATT_NOTIFY_UUID, properties: ['notify'] },
+    { uuid: GATT_WRITE_UUID, properties: ['write'] },
+  ];
+  const rejected = (): void =>
+    mockClient._simulateMessage(`${PREFIX}/notify/${GATT_NOTIFY_UUID}`, Buffer.from([0x10]));
+  const weighIn = (): void => {
+    const buf = Buffer.alloc(4);
+    buf.writeUInt16LE(8000, 0);
+    buf.writeUInt16LE(450, 2);
+    mockClient._simulateMessage(`${PREFIX}/notify/${GATT_NOTIFY_UUID}`, buf);
+  };
+  const holding = (holdMs: number): ScaleAdapter => ({
+    ...createGattAdapter(),
+    completionHoldMs: holdMs,
+    isFinal: () => false,
+  });
+
+  function answerConnect(): void {
+    const origPublish = mockClient.publishAsync;
+    mockClient.publishAsync = vi.fn(async (topic: string, payload?: string | Buffer) => {
+      if (topic === `${PREFIX}/connect`) {
+        queueMicrotask(() =>
+          mockClient._simulateMessage(`${PREFIX}/connected`, JSON.stringify({ chars: CHARS })),
+        );
+      }
+      return origPublish(topic, payload);
+    });
+  }
+
+  describe('single-shot', () => {
+    const IDLE_MS = 5_000;
+
+    async function session(
+      adapter: ScaleAdapter,
+      drive: (ac: AbortController) => Promise<void>,
+    ): Promise<{ result: unknown; atMs: number }> {
+      vi.useFakeTimers();
+      try {
+        mockClient.subscribeAsync = vi.fn(async (topic: string) => {
+          if (topic === `${PREFIX}/status`) {
+            queueMicrotask(() => mockClient._simulateMessage(`${PREFIX}/status`, 'online'));
+          }
+          if (topic === `${PREFIX}/scan/results`) {
+            queueMicrotask(() =>
+              mockClient._simulateMessage(
+                `${PREFIX}/scan/results`,
+                JSON.stringify([{ address: MAC, name: 'GattScale', rssi: -50, services: [] }]),
+              ),
+            );
+          }
+          return [];
+        });
+        answerConnect();
+        const ac = new AbortController();
+        const t0 = Date.now();
+        let atMs = -1;
+        const outcome = scanAndReadRaw({
+          adapters: [adapter],
+          profile: PROFILE,
+          mqttProxy: MQTT_PROXY_CONFIG,
+          readingTimeoutMs: IDLE_MS,
+          abortSignal: ac.signal,
+        })
+          .then(
+            (r) => r,
+            (e: unknown) => e,
+          )
+          .finally(() => (atMs = Date.now() - t0));
+        await vi.advanceTimersByTimeAsync(0);
+        await drive(ac);
+        return { result: await outcome, atMs };
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it('ends a session that keeps sending rejected frames at 3 x idle, untagged', async () => {
+      const { result, atMs } = await session(createGattAdapter(), async () => {
+        for (let i = 0; i < 8; i++) {
+          rejected();
+          await vi.advanceTimersByTimeAsync(IDLE_MS / 2);
+        }
+      });
+      expect(result).toBeInstanceOf(SessionTimeoutError);
+      expect((result as Error).message).toBe('GATT session cap exceeded');
+      expect(atMs).toBe(3 * IDLE_MS);
+      expect(bleFailureKind(result)).toBeUndefined();
+    });
+
+    it('lets a composition hold run past the cap', async () => {
+      const { result, atMs } = await session(holding(4 * IDLE_MS), async () => {
+        weighIn();
+        await vi.advanceTimersByTimeAsync(5 * IDLE_MS);
+      });
+      expect(result).toMatchObject({ reading: { weight: 80 } });
+      expect(atMs).toBe(4 * IDLE_MS);
+    });
+
+    it('does not end the GATT session on the abort signal', async () => {
+      const { result } = await session(createGattAdapter(), async (ac) => {
+        ac.abort(new Error('shutdown'));
+        await vi.advanceTimersByTimeAsync(1_000);
+        weighIn();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(result).toMatchObject({ reading: { weight: 80 } });
+    });
+  });
+
+  for (const path of ['host', 'autonomous'] as const) {
+    describe(`watcher, ${path} connect`, () => {
+      const kind = path === 'host' ? 'GATT reading' : 'Autonomous GATT reading';
+      const label = path === 'host' ? MAC : `${MAC} (autonomous)`;
+
+      async function session(
+        adapter: ScaleAdapter,
+        drive: () => Promise<unknown>,
+      ): Promise<{ warns: string[]; reading: RawReadingLike | null; atMs: number }> {
+        vi.useFakeTimers();
+        const warns: string[] = [];
+        let t0 = 0;
+        vi.spyOn(bleLog, 'warn').mockImplementation(
+          (m) => void warns.push(`${Date.now() - t0} ms: ${String(m)}`),
+        );
+        try {
+          const config = { ...MQTT_PROXY_CONFIG, auto_connect: path === 'autonomous' };
+          const watcher = new ReadingWatcher(config, [adapter], undefined, PROFILE);
+          await watcher.start();
+          answerConnect();
+          t0 = Date.now();
+          let reading: RawReadingLike | null = null;
+          let atMs = -1;
+          void watcher.nextReading().then((r) => {
+            reading = r;
+            atMs = Date.now() - t0;
+          });
+          if (path === 'host') {
+            mockClient._simulateMessage(
+              `${PREFIX}/scan/results`,
+              JSON.stringify([{ address: MAC, name: 'GattScale', rssi: -50, services: [] }]),
+            );
+          } else {
+            mockClient._simulateMessage(
+              `${PREFIX}/connected`,
+              JSON.stringify({ autonomous: true, address: MAC, chars: CHARS }),
+            );
+          }
+          await vi.advanceTimersByTimeAsync(0);
+          await drive();
+          await watcher.stop();
+          return { warns: warns.filter((w) => w.includes(`: ${kind} failed`)), reading, atMs };
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+
+      it('ends a silent session on the 60 s idle timeout', async () => {
+        const { warns } = await session(createGattAdapter(), () =>
+          vi.advanceTimersByTimeAsync(65_000),
+        );
+        expect(warns).toEqual([
+          `60000 ms: ${kind} failed for ${MAC}: GATT reading timeout for ${label}`,
+        ]);
+      });
+
+      it('ends a session that keeps sending rejected frames at the 90 s cap', async () => {
+        const { warns } = await session(createGattAdapter(), async () => {
+          for (let t = 0; t < 90_000; t += 30_000) {
+            rejected();
+            await vi.advanceTimersByTimeAsync(30_000);
+          }
+        });
+        expect(warns).toEqual([
+          `90000 ms: ${kind} failed for ${MAC}: GATT session cap exceeded for ${label}`,
+        ]);
+      });
+
+      it('hands a held weight over at the 90 s cap, which the hold does not move', async () => {
+        const { reading, atMs } = await session(holding(120_000), async () => {
+          weighIn();
+          await vi.advanceTimersByTimeAsync(125_000);
+        });
+        expect(reading).toMatchObject({ reading: { weight: 80 } });
+        expect(atMs).toBe(90_000);
+      });
+    });
+  }
+});
+
+/** What nextReading resolves with, as far as these tests look at it. */
+type RawReadingLike = { reading: ScaleReading };

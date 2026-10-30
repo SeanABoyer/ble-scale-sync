@@ -4,8 +4,10 @@ import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
   defaultProfile,
+  makeConnectionContext,
   assertPayloadRanges,
 } from '../helpers/scale-test-utils.js';
+import { WEIGHT_ONLY_HOLD_MS } from '../../src/scales/body-comp-helpers.js';
 
 function makeAdapter() {
   return new RenphoEs26bbAdapter();
@@ -42,13 +44,13 @@ function makeOfflineFrame(weightX100: number, impedance: number, secondsAgo = 0)
 function makeMockCtx(): { ctx: ConnectionContext; write: ReturnType<typeof vi.fn> } {
   const write = vi.fn().mockResolvedValue(undefined);
   return {
-    ctx: {
+    ctx: makeConnectionContext({
       write,
       read: vi.fn().mockResolvedValue(Buffer.alloc(0)),
       subscribe: vi.fn().mockResolvedValue(undefined),
       profile: defaultProfile(),
       deviceAddress: 'AA:BB:CC:DD:EE:FF',
-    },
+    }),
     write,
   };
 }
@@ -191,13 +193,13 @@ describe('RenphoEs26bbAdapter', () => {
     it('survives ack write failure without throwing', async () => {
       const adapter = makeAdapter();
       const write = vi.fn().mockRejectedValue(new Error('disconnected'));
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write,
         read: vi.fn().mockResolvedValue(Buffer.alloc(0)),
         subscribe: vi.fn().mockResolvedValue(undefined),
         profile: defaultProfile(),
         deviceAddress: 'AA:BB:CC:DD:EE:FF',
-      };
+      });
       // First call (start cmd) also rejects but onConnected swallows it.
       await expect(adapter.onConnected(ctx)).resolves.toBeUndefined();
       write.mockClear();
@@ -226,8 +228,23 @@ describe('RenphoEs26bbAdapter', () => {
       expect(makeAdapter().isComplete({ weight: 10, impedance: 500 })).toBe(false);
     });
 
-    it('returns false when impedance is 0', () => {
-      expect(makeAdapter().isComplete({ weight: 80, impedance: 0 })).toBe(false);
+    it('completes a final weight without impedance after a short hold (D-07, D028)', () => {
+      // The final 0x14 frame of a weigh-in the scale could not analyse (socks,
+      // a child) carries impedance 0. It used to be refused for good, so the
+      // session ended in "disconnected before reading completed" and the
+      // weight was lost.
+      const adapter = makeAdapter();
+      const reading = adapter.parseNotification(makeLiveFrame(8000, 0))!;
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(false);
+      expect(adapter.completionHoldMs).toBe(WEIGHT_ONLY_HOLD_MS);
+    });
+
+    it('resolves at once on a final frame with impedance', () => {
+      const adapter = makeAdapter();
+      const reading = adapter.parseNotification(makeLiveFrame(8000, 500))!;
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(true);
     });
   });
 
@@ -246,5 +263,46 @@ describe('RenphoEs26bbAdapter', () => {
       const payload = makeAdapter().computeMetrics({ weight: 0, impedance: 0 }, defaultProfile());
       expect(payload.weight).toBe(0);
     });
+  });
+});
+
+// #386: this adapter parses an impedance out of the scale's frames and used to
+// hand buildPayload an empty comp, so the exported body fat was the Deurenberg
+// BMI estimate and the impedance was published but ignored.
+//
+// At 80 kg / 183 cm / 30 / male the two answers are far apart, which is the
+// point: 19.37 % from BMI alone, 25.06 % from a 500 ohm BIA reading. Anyone
+// comparing against their vendor app sees the difference immediately.
+describe('Renpho ES-26BB BIA from the parsed impedance (#386)', () => {
+  const BMI_ONLY_FAT = 19.37;
+  const BIA_FAT_AT_500 = 25.06;
+
+  it('computes body fat from a plausible impedance instead of from BMI', () => {
+    const payload = makeAdapter().computeMetrics({ weight: 80, impedance: 500 }, defaultProfile());
+    expect(payload.bodyFatPercent).toBeCloseTo(BIA_FAT_AT_500, 1);
+    expect(payload.impedance).toBe(500);
+  });
+
+  it('moves every derived field with it, not just the fat percentage', () => {
+    // Worth pinning: the physique rating crosses a threshold here, so a user
+    // watching that number sees it drop from 5 to 2 on the same body.
+    const payload = makeAdapter().computeMetrics({ weight: 80, impedance: 500 }, defaultProfile());
+    expect(payload.physiqueRating).toBe(2);
+    expect(payload.visceralFat).toBe(12);
+    expect(payload.waterPercent).toBeCloseTo(54.7, 2);
+  });
+
+  it('falls back to the BMI estimate when the impedance is not a body', () => {
+    // A bad resistance is worse than none. Out of band it is refused and the
+    // reading lands on exactly the number this adapter published before.
+    for (const impedance of [1, 149, 1201, 65535]) {
+      const payload = makeAdapter().computeMetrics({ weight: 80, impedance }, defaultProfile());
+      expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
+    }
+  });
+
+  it('still falls back when no impedance was measured at all', () => {
+    const payload = makeAdapter().computeMetrics({ weight: 80, impedance: 0 }, defaultProfile());
+    expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
   });
 });

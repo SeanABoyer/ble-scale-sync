@@ -1,5 +1,5 @@
 import noble from '@stoprocent/noble';
-import { createNobleHandler } from './handler-noble-shared.js';
+import { createNobleHandler } from './handler-noble-shared/index.js';
 
 /**
  * BLE handler backed by `@stoprocent/noble` (macOS default; Linux/Windows via
@@ -14,6 +14,5 @@ const handler = createNobleHandler({
 });
 
 export const scanAndReadRaw = handler.scanAndReadRaw;
-export const scanAndRead = handler.scanAndRead;
 export const scanDevices = handler.scanDevices;
 export const _internals = handler._internals;

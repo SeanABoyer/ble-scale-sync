@@ -38,8 +38,13 @@ function res(body: unknown, opts: { ok?: boolean; status?: number } = {}) {
   };
 }
 
+/** A UUID like the ones wger (2.6+) uses as ids, distinct per n. */
+function uuid(n: number): string {
+  return `0199a3c4-5d6e-7f80-9a1b-${String(n).padStart(12, '0')}`;
+}
+
 /** Default happy-path router: configurable category list, category creation, then 201s. */
-function routeHappy(existing: Array<{ id: number; name: string; unit: string }> = []) {
+function routeHappy(existing: Array<{ id: string | number; name: string; unit: string }> = []) {
   let nextId = 100;
   mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
     const method = init?.method ?? 'GET';
@@ -47,7 +52,7 @@ function routeHappy(existing: Array<{ id: number; name: string; unit: string }> 
       return Promise.resolve(res({ count: existing.length, next: null, results: existing }));
     }
     if (url.endsWith('/measurement-category/') && method === 'POST') {
-      return Promise.resolve(res({ id: nextId++, name: 'x', unit: 'x' }, { status: 201 }));
+      return Promise.resolve(res({ id: uuid(nextId++), name: 'x', unit: 'x' }, { status: 201 }));
     }
     if (url.endsWith('/measurement/') && method === 'POST') {
       return Promise.resolve(res({ id: 1 }, { status: 201 }));
@@ -107,16 +112,27 @@ describe('WgerExporter', () => {
       .map((c) => JSON.parse(c[1].body as string))
       .find((b) => b.value === 18.5);
     expect(fat).toBeDefined();
-    expect(typeof fat.category).toBe('number');
+    // Body Fat is the first category created
+    expect(fat.category).toBe(uuid(100));
     expect(fat.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
   it('reuses an existing category id and does not recreate it', async () => {
-    routeHappy([{ id: 7, name: 'Body Fat', unit: '%' }]);
+    routeHappy([{ id: uuid(7), name: 'Body Fat', unit: '%' }]);
     await new WgerExporter(config).export(sample);
 
     // Only the 3 missing categories are created (Body Fat already exists).
     expect(calls('POST', '/measurement-category/')).toHaveLength(3);
+    const fat = calls('POST', '/measurement/')
+      .map((c) => JSON.parse(c[1].body as string))
+      .find((b) => b.value === 18.5);
+    expect(fat.category).toBe(uuid(7));
+  });
+
+  it('passes the integer category id of a wger older than 2.6 back unchanged', async () => {
+    routeHappy([{ id: 7, name: 'Body Fat', unit: '%' }]);
+    await new WgerExporter(config).export(sample);
+
     const fat = calls('POST', '/measurement/')
       .map((c) => JSON.parse(c[1].body as string))
       .find((b) => b.value === 18.5);
@@ -128,6 +144,21 @@ describe('WgerExporter', () => {
     const values = calls('POST', '/measurement/').map((c) => JSON.parse(c[1].body as string).value);
     expect(values).not.toContain(0);
     expect(values).toHaveLength(3);
+  });
+
+  // #497: withheld values (null) are not sent; the weight still is.
+  it('posts no measurement for a withheld value', async () => {
+    await new WgerExporter(config).export({
+      ...sample,
+      bodyFatPercent: null,
+      waterPercent: null,
+      boneMass: null,
+      muscleMass: null,
+      visceralFat: null,
+      physiqueRating: null,
+    });
+    expect(calls('POST', '/weightentry/')).toHaveLength(1);
+    expect(calls('POST', '/measurement/')).toHaveLength(0);
   });
 
   it('caches categories across exports (lists only once)', async () => {
@@ -163,7 +194,13 @@ describe('WgerExporter', () => {
   });
 
   it('does not retry a 4xx weight response', async () => {
-    mockFetch.mockResolvedValue(res({ detail: 'bad' }, { status: 400 }));
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        (url as string).endsWith('/userprofile/')
+          ? res({ weight_unit: 'kg' })
+          : res({ detail: 'bad' }, { status: 400 }),
+      ),
+    );
     await new WgerExporter({ ...config, syncMeasurements: false }).export(sample);
     expect(calls('POST', '/weightentry/')).toHaveLength(1);
   });
@@ -181,6 +218,62 @@ describe('WgerExporter', () => {
     });
     const result = await new WgerExporter(config).export(sample);
     expect(result.success).toBe(true);
+  });
+
+  // F-03: wger stores a weight entry in the unit of the user's profile, and
+  // the API takes no unit. Kilograms written to a pound profile were stored
+  // as pounds, 2.2 times too light.
+  describe('profile weight unit (F-03)', () => {
+    function routeProfile(profile: unknown, status = 200) {
+      const happy = mockFetch.getMockImplementation()!;
+      mockFetch.mockImplementation((url: string, init?: { method?: string }) =>
+        (url as string).endsWith('/userprofile/') && (init?.method ?? 'GET') === 'GET'
+          ? Promise.resolve(res(profile, { status }))
+          : happy(url, init),
+      );
+    }
+    const weightSent = () =>
+      JSON.parse(calls('POST', '/weightentry/')[0][1].body as string).weight as number;
+
+    it('writes pounds to an account whose profile is in pounds', async () => {
+      routeProfile({ username: 'a', weight_unit: 'lb' });
+      const result = await new WgerExporter(config).export(sample);
+      expect(result.success).toBe(true);
+      expect(weightSent()).toBe(176.37);
+    });
+
+    it('writes kilograms to an account whose profile is in kilograms', async () => {
+      routeProfile({ username: 'a', weight_unit: 'kg' });
+      await new WgerExporter(config).export(sample);
+      expect(weightSent()).toBe(80);
+    });
+
+    it('reads the profile on every export, so a changed unit is followed', async () => {
+      const e = new WgerExporter({ ...config, syncMeasurements: false });
+      routeProfile({ weight_unit: 'kg' });
+      await e.export(sample);
+      routeProfile({ weight_unit: 'lb' });
+      await e.export(sample);
+      const sent = calls('POST', '/weightentry/').map(
+        (c) => JSON.parse(c[1].body as string).weight,
+      );
+      expect(sent).toEqual([80, 176.37]);
+    });
+
+    it('does not write a weight it cannot put in the right unit', async () => {
+      routeProfile({ detail: 'no' }, 401);
+      const result = await new WgerExporter(config).export(sample);
+      expect(result.success).toBe(false);
+      expect(calls('POST', '/weightentry/')).toHaveLength(0);
+    });
+
+    it('refuses a unit it does not know instead of guessing', async () => {
+      routeProfile({ weight_unit: 'st' });
+      const result = await new WgerExporter(config).export(sample);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("'st'");
+      expect(calls('POST', '/weightentry/')).toHaveLength(0);
+    });
   });
 
   describe('healthcheck()', () => {

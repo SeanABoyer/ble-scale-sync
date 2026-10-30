@@ -9,7 +9,8 @@ import type {
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { uuid16, buildPayload } from './body-comp-helpers.js';
+import { uuid16, buildPayload, biaFatIfPlausible } from './body-comp-helpers.js';
+import { bleLog } from '../ble/types.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 
 // Beurer/Sanitas custom BLE service + characteristic
@@ -32,11 +33,25 @@ const KNOWN_NAMES = [
   'aicdscale1',
 ];
 
+/**
+ * Composition the scale computed itself, when it sent one.
+ *
+ * Every field is optional because a zero is not a measurement. buildPayload
+ * gates on `comp.fat ?? estimateBodyFat(...)`, which `0` passes, so a frame
+ * carrying a real impedance next to a zeroed fat used to export 0 % body fat,
+ * 73 % water and a muscle mass equal to the whole body. The sibling SIG adapter
+ * has guarded against exactly that since #211; this one never did.
+ */
 interface CachedComp {
-  fat: number;
-  water: number;
-  muscle: number;
-  bone: number;
+  fat?: number;
+  water?: number;
+  muscle?: number;
+  bone?: number;
+}
+
+/** A scale-reported value, or undefined when the scale reported nothing. */
+function measured(v: number): number | undefined {
+  return v > 0 ? v : undefined;
 }
 
 /**
@@ -62,6 +77,15 @@ const BF710_STABILITY_TOLERANCE_KG = 0.3;
 // Snoop shows composition lands ~10-12 s after the weight first stabilizes;
 // 15 s leaves margin without holding an unregistered scale's link too long.
 const BF710_COMPOSITION_HOLD_MS = 15000;
+
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class BeurerSanitasSession {
+  readingBuffer: number[] = [];
+  /** Accumulated 0x59 composition parts (part number -> payload after byte 4). */
+  compParts = new Map<number, Buffer>();
+  /** A 0x59 stream has sent part 1 and not yet its last part; see isCompositionPending. */
+  compPending = false;
+}
 
 export class BeurerSanitasScaleAdapter
   implements ScaleAdapterCore, GattWiring, Unlockable, AckProtocol, HoldForComposition
@@ -90,20 +114,16 @@ export class BeurerSanitasScaleAdapter
   };
   readonly charNotifyUuid = CHR_FFE1;
   readonly charWriteUuid = CHR_FFE1;
-  readonly normalizesWeight = true;
   readonly unlockIntervalMs = 5000;
 
   private isBf710Type = false;
-  private readingBuffer: number[] = [];
+  private s = new BeurerSanitasSession();
 
   /** INIT command: F7 01 for BF700/800, E7 01 for BF710/Sanitas. */
   get unlockCommand(): number[] {
     return this.isBf710Type ? [0xe7, 0x01] : [0xf7, 0x01];
   }
   private cachedComp: CachedComp | null = null;
-
-  /** Accumulated 0x59 composition parts (part number -> payload after byte 4). */
-  private compParts = new Map<number, Buffer>();
 
   /** Per-frame ACK echoing bytes [1..3]; BF710/SBF70 gate the 0x59 stream on it. */
   buildAck(data: Buffer): number[] | null {
@@ -121,6 +141,16 @@ export class BeurerSanitasScaleAdapter
   /** A reading carrying impedance is the final composition reading. */
   isFinal(reading: ScaleReading): boolean {
     return reading.impedance > 0;
+  }
+
+  /**
+   * True from 0x59 part 1 until the stream's last part. On a slow link the
+   * SBF75 sends part 1 about a second before the 15 s hold ends, and each
+   * part waits for an ACK round trip, so the hold is extended while this is
+   * set (#211).
+   */
+  isCompositionPending(): boolean {
+    return this.s.compPending;
   }
 
   matches(device: BleDeviceInfo): boolean {
@@ -161,6 +191,22 @@ export class BeurerSanitasScaleAdapter
    * (unregistered user) falls back to the weight-only stability window.
    */
   parseNotification(data: Buffer): ScaleReading | null {
+    // Latch the variant off the frame itself, not only off the advertised name.
+    // `matches()` is the only other place that sets it, and it does not always
+    // run: `ble.force_scale_adapter` replaces the matcher wholesale, and a unit
+    // advertising a name that is not in KNOWN_NAMES never reaches it either. A
+    // BF710/SBF70/SBF75 opens every frame with 0xE7, while a BF700/BF800 frame
+    // opens with a Unix timestamp, whose top byte does not reach 0xE7 until
+    // 2092. Without this an SBF70 fell through to the BF700 layout, where the
+    // 5-byte live frames are too short to parse and the 0x59 finalize frame
+    // decodes as a constant 12.80 kg (#384, same symptom as #112).
+    if (!this.isBf710Type && data.length >= 2 && data[0] === 0xe7) {
+      this.isBf710Type = true;
+      bleLog.debug(
+        'Beurer/Sanitas: 0xE7 frame seen, switching to the BF710/SBF70/SBF75 frame layout',
+      );
+    }
+
     if (this.isBf710Type) {
       return this.parseBf710Notification(data);
     }
@@ -177,14 +223,14 @@ export class BeurerSanitasScaleAdapter
       impedance = data.readUInt16BE(6);
 
       this.cachedComp = {
-        fat: data.readUInt16BE(8) / 10,
-        water: data.readUInt16BE(10) / 10,
-        muscle: data.readUInt16BE(12) / 10,
-        bone: (data.readUInt16BE(14) * 50) / 1000,
+        fat: measured(data.readUInt16BE(8) / 10),
+        water: measured(data.readUInt16BE(10) / 10),
+        muscle: measured(data.readUInt16BE(12) / 10),
+        bone: measured((data.readUInt16BE(14) * 50) / 1000),
       };
     }
 
-    return { weight, impedance };
+    return this.emit(weight, impedance);
   }
 
   private parseBf710Notification(data: Buffer): ScaleReading | null {
@@ -196,12 +242,12 @@ export class BeurerSanitasScaleAdapter
       const weight = (data.readUInt16BE(3) * 50) / 1000;
       if (weight <= 0 || weight > 300 || !Number.isFinite(weight)) return null;
 
-      this.readingBuffer.push(weight);
-      if (this.readingBuffer.length > BF710_STABILITY_COUNT) {
-        this.readingBuffer.shift();
+      this.s.readingBuffer.push(weight);
+      if (this.s.readingBuffer.length > BF710_STABILITY_COUNT) {
+        this.s.readingBuffer.shift();
       }
       this.cachedComp = null;
-      return { weight, impedance: 0 };
+      return this.emit(weight, 0);
     }
 
     if (cmd === 0x59 && data.length >= 4) {
@@ -228,23 +274,25 @@ export class BeurerSanitasScaleAdapter
     const part = data[3];
 
     if (part <= 1) {
-      this.compParts.clear();
+      this.s.compParts.clear();
+      this.s.compPending = count > 1;
       return null;
     }
 
-    this.compParts.set(part, Buffer.from(data.subarray(4)));
+    this.s.compParts.set(part, Buffer.from(data.subarray(4)));
     if (part < count) return null;
+    this.s.compPending = false;
 
     const ordered: Buffer[] = [];
     for (let p = 2; p <= count; p++) {
-      const chunk = this.compParts.get(p);
+      const chunk = this.s.compParts.get(p);
       if (!chunk) {
-        this.compParts.clear();
+        this.s.compParts.clear();
         return null;
       }
       ordered.push(chunk);
     }
-    this.compParts.clear();
+    this.s.compParts.clear();
 
     const merged = Buffer.concat(ordered);
     if (merged.length < 16) return null;
@@ -262,37 +310,84 @@ export class BeurerSanitasScaleAdapter
     }
     if (weight <= 0 || weight > 300 || !Number.isFinite(weight)) return null;
 
-    this.cachedComp = { fat, water, muscle, bone };
-    return { weight, impedance };
+    this.cachedComp = {
+      fat: measured(fat),
+      water: measured(water),
+      muscle: measured(muscle),
+      bone: measured(bone),
+    };
+    return this.emit(weight, impedance);
+  }
+
+  /**
+   * Build a reading that carries the composition that produced it.
+   *
+   * `computeMetrics()` runs LATER than the parse that built the reading, and
+   * the very next parse nulls `cachedComp`. On the watcher transports
+   * (mqtt-proxy, esphome-proxy) that next parse can belong to the NEXT session:
+   * `loop.ts` awaits `processReading()` - network exports included - while the
+   * watcher is free to open another GATT session. Reading the live cache in
+   * `computeMetrics` would then hand the completed reading a null.
+   */
+  private emit(weight: number, impedance: number): ScaleReading {
+    return { weight, impedance, scaleComposition: this.cachedComp ? { ...this.cachedComp } : null };
+  }
+
+  /**
+   * Two fields are deliberately NOT in the session object:
+   *
+   *   - `cachedComp` is read by computeMetrics, which runs after the session is
+   *     over. Clearing per-session state that a later computeMetrics reads is
+   *     the trap this whole change exists to avoid, and it is why onSessionEnd
+   *     was the wrong hook. It does NOT get nulled at the top of every parse -
+   *     only on the paths that go on to build a reading (the length/range
+   *     guards return first). What holds is the weaker but sufficient
+   *     invariant: every path that RETURNS a reading nulls or overwrites it
+   *     first, and `emit()` then snapshots it onto that reading. Preserve that
+   *     invariant if a fourth return path is ever added.
+   *   - `isBf710Type` drives the `unlockCommand` and `completionHoldMs` getters,
+   *     which are read at session start before any frame. Clearing the latch
+   *     would send [0xF7 0x01] and a 0 ms hold to a BF710 whose advertised name
+   *     is not in KNOWN_NAMES, which is the #384 case the latch exists for.
+   */
+  onSessionStart(): void {
+    this.s = new BeurerSanitasSession();
   }
 
   isComplete(reading: ScaleReading): boolean {
     if (this.isBf710Type) {
       if (reading.impedance > 0) return true;
-      if (this.readingBuffer.length < BF710_STABILITY_COUNT) return false;
-      const min = Math.min(...this.readingBuffer);
-      const max = Math.max(...this.readingBuffer);
+      if (this.s.readingBuffer.length < BF710_STABILITY_COUNT) return false;
+      const min = Math.min(...this.s.readingBuffer);
+      const max = Math.max(...this.s.readingBuffer);
       return max - min <= BF710_STABILITY_TOLERANCE_KG && reading.weight > 0;
     }
     return reading.weight > 0;
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const comp = this.cachedComp;
-    if (comp) {
-      return buildPayload(
-        reading.weight,
-        reading.impedance,
-        {
-          fat: comp.fat,
-          water: comp.water,
-          muscle: comp.muscle,
-          bone: comp.bone,
-        },
-        profile,
-      );
-    }
-
-    return buildPayload(reading.weight, reading.impedance, {}, profile);
+    // Snapshot taken in emit(). A null one ("this reading carried no
+    // composition") is a real answer and must not fall through to the live
+    // cache, which is only for a reading this adapter did not build (direct
+    // callers, tests).
+    const own = reading.scaleComposition as CachedComp | null | undefined;
+    const comp = (own === undefined ? this.cachedComp : own) ?? {};
+    // The scale's own figure wins when it sent one. Where it did not, the
+    // impedance this adapter already parsed is used rather than thrown away
+    // (#386). On the normal path the two arrive together, so this mostly
+    // matters for a frame that carried a resistance and a zeroed composition,
+    // and under BLE_RAW_CAPTURE, where a rejected trailing weight frame can
+    // clear the cache while the captured reading still holds an impedance.
+    return buildPayload(
+      reading.weight,
+      reading.impedance,
+      {
+        fat: comp.fat ?? biaFatIfPlausible(reading.weight, reading.impedance, profile),
+        water: comp.water,
+        muscle: comp.muscle,
+        bone: comp.bone,
+      },
+      profile,
+    );
   }
 }

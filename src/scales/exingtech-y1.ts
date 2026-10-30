@@ -3,16 +3,23 @@ import type {
   ConnectionContext,
   ScaleAdapterCore,
   GattWiring,
+  HoldForComposition,
   ScaleReading,
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { buildPayload, type ScaleBodyComp } from './body-comp-helpers.js';
+import { buildPayload, WEIGHT_ONLY_HOLD_MS, type ScaleBodyComp } from './body-comp-helpers.js';
 import { matchesDescriptor, type MatchDescriptor } from './match-descriptor.js';
 
 // Custom 128-bit UUIDs (remove dashes, lowercase)
 const CHR_NOTIFY = '1a2ea40075b911e2be050002a5d5c51b';
 const CHR_WRITE = '29f1108075b911e28bf60002a5d5c51b';
+
+/** One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md). */
+class ExingtechSession {
+  /** Body-composition values from the most recent parsed frame. */
+  cachedComp: ScaleBodyComp = {};
+}
 
 /**
  * Adapter for Exingtech Y1 / "vscale" BLE body-fat scales.
@@ -22,9 +29,10 @@ const CHR_WRITE = '29f1108075b911e28bf60002a5d5c51b';
  *   - 20-byte frames with weight, fat, water, bone, muscle, visceral fat
  *   - Weight at [4-5] big-endian uint16 / 10 (kg)
  *   - Body comp fields at subsequent offsets, each BE uint16 / 10
- *   - Complete when fat byte at [6] is not 0xFF
+ *   - Composition present when the fat byte at [6] is not 0xFF; a frame without it
+ *     completes weight-only after WEIGHT_ONLY_HOLD_MS (D028)
  */
-export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring {
+export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring, HoldForComposition {
   readonly name = 'Exingtech Y1';
   readonly match: MatchDescriptor = {
     priority: 120,
@@ -34,10 +42,7 @@ export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring {
   readonly charNotifyUuid = CHR_NOTIFY;
   readonly charWriteUuid = CHR_WRITE;
 
-  readonly normalizesWeight = true;
-
-  /** Cached body-composition values from the most recent parsed frame. */
-  private cachedComp: ScaleBodyComp = {};
+  private s = new ExingtechSession();
 
   matches(device: BleDeviceInfo): boolean {
     return matchesDescriptor(device, this.match);
@@ -67,7 +72,7 @@ export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring {
    *   [14]     visceral fat rating
    *   [15-19]  padding / reserved
    */
-  parseNotification(data: Buffer): ScaleReading | null {
+  parseNotification(data: Buffer): ScaleReading<ScaleBodyComp> | null {
     if (data.length < 15) return null;
 
     const weight = data.readUInt16BE(4) / 10;
@@ -82,7 +87,7 @@ export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring {
 
     const complete = data[6] !== 0xff;
 
-    this.cachedComp = {
+    this.s.cachedComp = {
       fat: complete ? fat : undefined,
       water: complete ? water : undefined,
       bone: complete ? bone : undefined,
@@ -90,14 +95,40 @@ export class ExingtechY1Adapter implements ScaleAdapterCore, GattWiring {
       visceralFat: complete ? visceral : undefined,
     };
 
-    return { weight, impedance: 0 };
+    return { weight, impedance: 0, scaleComposition: this.s.cachedComp };
   }
 
+  /**
+   * The weight completes the reading; the composition makes it final (ADR D028,
+   * review D-07).
+   *
+   * Requiring a fat value here meant a weigh-in the scale could not analyse
+   * (socks, a child, a short step-on) never produced a reading at all: the
+   * session ran into its timeout and the weight was lost. Now such a reading
+   * holds the link for `WEIGHT_ONLY_HOLD_MS`, resolves at once if a frame with
+   * composition arrives, and otherwise completes with the weight alone.
+   */
   isComplete(reading: ScaleReading): boolean {
-    return reading.weight > 0 && this.cachedComp.fat != null && this.cachedComp.fat > 0;
+    return reading.weight > 0;
   }
 
-  computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    return buildPayload(reading.weight, reading.impedance, this.cachedComp, profile);
+  readonly completionHoldMs = WEIGHT_ONLY_HOLD_MS;
+
+  isFinal(reading: ScaleReading<ScaleBodyComp>): boolean {
+    const fat = (reading.scaleComposition ?? this.s.cachedComp).fat;
+    return fat != null && fat > 0;
+  }
+
+  onSessionStart(): void {
+    this.s = new ExingtechSession();
+  }
+
+  computeMetrics(reading: ScaleReading<ScaleBodyComp>, profile: UserProfile): BodyComposition {
+    return buildPayload(
+      reading.weight,
+      reading.impedance,
+      reading.scaleComposition ?? this.s.cachedComp,
+      profile,
+    );
   }
 }

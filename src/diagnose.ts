@@ -2,8 +2,31 @@
 import { loadBleConfig } from './config/load.js';
 import { createLogger } from './logger.js';
 import { sleep, withTimeout, errMsg } from './ble/types.js';
+import { rethrowAsTransportError } from './ble/transport-availability.js';
+import { safeName } from './ble/advertisement.js';
+import { waitForPoweredOn } from './ble/handler-noble-shared/state.js';
+import type { NobleApi } from './ble/handler-noble-shared/types.js';
+import { parseMfgData } from './ble/handler-noble-shared/peripheral.js';
+import { parseQnBroadcast } from './scales/qn-scale/broadcast.js';
+import type { HandlerKey } from './ble/transport-availability.js';
+import { diagnoseMacArg, toolConfigArg } from './cli-run-args.js';
 
 const log = createLogger('Diagnose');
+
+/**
+ * diagnose is the tool people run precisely when BLE is broken, so a missing
+ * optional stack must name itself here too, not only in the handler switch.
+ */
+async function loadNoble(driver: string): Promise<any> {
+  const key: HandlerKey = driver === 'stoprocent' ? 'noble' : 'noble-legacy';
+  try {
+    return driver === 'stoprocent'
+      ? (await import('@stoprocent/noble')).default
+      : (await import('@abandonware/noble')).default;
+  } catch (err) {
+    rethrowAsTransportError(key, err);
+  }
+}
 
 function hex(buf: Buffer | undefined): string {
   if (!buf || buf.length === 0) return '(none)';
@@ -19,30 +42,38 @@ function resolveDriver(configured?: string): string {
   return process.platform === 'darwin' ? 'stoprocent' : 'abandonware';
 }
 
-async function waitForPoweredOn(noble: any): Promise<void> {
-  const getState = (): string => noble.state ?? noble._state ?? 'unknown';
-  if (getState() === 'poweredOn') return;
-
-  log.info('Waiting for Bluetooth adapter...');
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error(`Bluetooth adapter state: '${getState()}' (not poweredOn)`)),
-      10_000,
-    );
-    const onState = (state: string): void => {
-      if (state === 'poweredOn') {
-        clearTimeout(timeout);
-        noble.removeListener('stateChange', onState);
-        resolve();
-      }
-    };
-    noble.on('stateChange', onState);
-  });
-}
-
 async function main(): Promise<void> {
-  const bleConfig = loadBleConfig();
-  const scaleMac = (process.argv[2] ?? bleConfig.scaleMac)?.toUpperCase();
+  // The config.yaml the app would run with, --config included, read with the
+  // same defaults, ${VAR} references and validation for the ble section (G-05).
+  const arg = toolConfigArg(process.argv.slice(2));
+  if (arg.kind === 'error') throw new Error(arg.message);
+  const bleConfig = loadBleConfig(arg.config);
+  // A leading dash is a flag, never a MAC: `diagnose --config x.yaml` used to
+  // scan forever for a device called "--CONFIG".
+  const positional = diagnoseMacArg(process.argv.slice(2));
+  const scaleMac = (positional ?? bleConfig.scaleMac)?.toUpperCase();
+
+  // This tool drives a local radio through Noble directly, on purpose: it
+  // exists to answer "is Bluetooth on THIS host working", which a proxy
+  // transport cannot answer for it. On a proxy-only setup the Noble import is
+  // the first thing to fail, and it fails as a node-gyp "No native build was
+  // found" error that reads like a broken install rather than a tool being
+  // pointed at the wrong thing (#376). Say which it is.
+  const PROXY_HANDLERS = ['mqtt-proxy', 'esphome-proxy', 'ha-bluetooth'];
+  const forceNative = process.argv.includes('--native');
+  if (bleConfig.bleHandler && PROXY_HANDLERS.includes(bleConfig.bleHandler) && !forceNative) {
+    log.info('BLE Diagnostic Tool');
+    log.info('');
+    log.info(`Configured transport: ${bleConfig.bleHandler}`);
+    log.info('');
+    log.info('This tool tests the local Bluetooth radio through Noble, and your');
+    log.info('config routes BLE through a proxy instead, so there is nothing here');
+    log.info('for it to check. `start` and `scan` both use the configured');
+    log.info('transport and are the right tools for a proxy setup.');
+    log.info('');
+    log.info("To test this host's own radio anyway, pass --native.");
+    return;
+  }
 
   if (bleConfig.nobleDriver) {
     process.env.NOBLE_DRIVER = bleConfig.nobleDriver;
@@ -62,17 +93,29 @@ async function main(): Promise<void> {
   } else {
     log.info('Target MAC:   (none)');
     log.info('');
-    log.info('Tip: npm run diagnose -- MAC_ADDRESS');
+    log.info('Tip: ble-scale-sync diagnose MAC_ADDRESS');
+    log.info('  (from a git checkout: npm run diagnose -- MAC_ADDRESS)');
     log.info('  or set scale_mac in config.yaml');
   }
   log.info('');
 
-  const noble =
-    driver === 'stoprocent'
-      ? (await import('@stoprocent/noble')).default
-      : (await import('@abandonware/noble')).default;
+  const noble = await loadNoble(driver);
 
-  await waitForPoweredOn(noble);
+  // The shared one, not a copy: the copy that lived here was missing the
+  // btmgmt reset retry, so `npm run diagnose` failed with "adapter not
+  // poweredOn" on exactly the adapter state a normal run recovers from (#406).
+  //
+  // Two consequences worth knowing while reading the output: the wait is
+  // announced here because the shared function only logs at debug level, and a
+  // stuck adapter is power-cycled with btmgmt, which briefly disturbs other BLE
+  // clients on this host. Both match what a normal run does.
+  if (((noble.state ?? noble._state) as string) !== 'poweredOn') {
+    log.info('Waiting for the Bluetooth adapter (resetting it if it stays down)...');
+  }
+  await waitForPoweredOn(
+    noble as NobleApi,
+    () => (noble.state ?? noble._state ?? 'unknown') as string,
+  );
   log.info('Bluetooth adapter: ready\n');
 
   // ─── Phase 1: Scan ────────────────────────────────────────────────────────
@@ -106,7 +149,7 @@ async function main(): Promise<void> {
     const marker = isTarget ? ' <<<' : '';
 
     log.info(
-      `  ${rawAddr}  ${name || '(no name)'}  RSSI=${rssi}  ` +
+      `  ${rawAddr}  ${safeName(name) || '(no name)'}  RSSI=${rssi}  ` +
         `${connectable ? 'connectable' : 'broadcast-only'}  type=${addrType}${marker}`,
     );
     if (svcUuids.length > 0) {
@@ -115,13 +158,31 @@ async function main(): Promise<void> {
     if (mfgData && mfgData.length > 0) {
       log.info(`    Manufacturer data: ${hex(mfgData)}`);
 
-      // Parse QN broadcast weight from AABB manufacturer data
-      if (mfgData.length >= 26 && mfgData[2] === 0xaa && mfgData[3] === 0xbb) {
-        const rawWeight = mfgData.readUInt16LE(17);
-        const weight = rawWeight / 100;
-        const stable = mfgData[15] === 0x25;
+      // QN broadcast weight, through the SAME decoder the read path uses.
+      //
+      // This block used to re-implement it and got it wrong: the production
+      // path is handed manufacturer data with the 2-byte company id already
+      // stripped, so its offsets are relative to that. This copy read the RAW
+      // buffer, correctly shifted the AABB magic to [2..3] and then read the
+      // status byte and the weight at the UNSHIFTED offsets, so the two
+      // disagreed by two bytes on every field but the header. This is the tool
+      // people are told to run when something is wrong (#406).
+      const parsed = parseMfgData(mfgData);
+      const qn = parsed ? parseQnBroadcast(parsed.data) : null;
+      if (qn) {
+        log.info(`    QN broadcast: ${qn.weight.toFixed(2)} kg (stable)`);
+      } else if (
+        parsed &&
+        parsed.data.length >= 2 &&
+        parsed.data[0] === 0xaa &&
+        parsed.data[1] === 0xbb
+      ) {
+        // The magic matches but the decoder refused the payload. Deliberately
+        // not called "measuring": that is only one of the reasons, the others
+        // being a payload shorter than 19 bytes or a zero weight, and this tool
+        // exists to show what is there rather than to guess.
         log.info(
-          `    QN broadcast: ${weight.toFixed(2)} kg ${stable ? '(stable)' : '(measuring)'}`,
+          `    QN broadcast: AABB payload (${parsed.data.length}B) with no stable weight in it`,
         );
       }
     }

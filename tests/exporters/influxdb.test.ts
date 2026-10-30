@@ -127,9 +127,45 @@ describe('toLineProtocol()', () => {
     expect(line).toContain('metabolicAge=30i');
   });
 
+  // #497: a metric only some weigh-ins carry is a field only when it is there.
+  it('writes a skeletal muscle percentage as a float field when the payload has one', () => {
+    const line = toLineProtocol({ ...samplePayload, skeletalMusclePercent: 47.8 }, 'test');
+    expect(line).toContain(',skeletalMusclePercent=47.80,');
+  });
+
+  it('writes no field, and no undefined or NaN, for a metric the payload does not have', () => {
+    const fields = toLineProtocol(samplePayload, 'test', undefined, new Date(0)).split(' ')[1];
+    expect(fields).toBe(
+      'weight=80.00,bmi=23.90,bodyFatPercent=18.50,waterPercent=55.20,boneMass=3.10,' +
+        'muscleMass=62.40,impedance=500i,visceralFat=8i,physiqueRating=5i,bmr=1750i,' +
+        'metabolicAge=30i',
+    );
+  });
+
+  // #497: line protocol has no null, so a withheld value is no field at all.
+  it('writes no field for a withheld (null) value', () => {
+    const withheld = {
+      ...samplePayload,
+      bodyFatPercent: null,
+      waterPercent: null,
+      boneMass: null,
+      muscleMass: null,
+      visceralFat: null,
+      physiqueRating: null,
+    };
+    const fields = toLineProtocol(withheld, 'test', undefined, new Date(0)).split(' ')[1];
+    expect(fields).toBe('weight=80.00,bmi=23.90,impedance=500i,bmr=1750i,metabolicAge=30i');
+  });
+
   it('starts with measurement name', () => {
     const line = toLineProtocol(samplePayload, 'body_composition');
     expect(line).toMatch(/^body_composition /);
+  });
+
+  // F-18: an unescaped space or comma ends the measurement and the line is rejected.
+  it('escapes spaces and commas in the measurement name', () => {
+    const line = toLineProtocol(samplePayload, 'body composition,v2', 'dad');
+    expect(line).toMatch(/^body\\ composition\\,v2,user=dad /);
   });
 
   it('ends with timestamp in milliseconds', () => {
@@ -167,5 +203,61 @@ describe('InfluxDbExporter back-date support', () => {
     const body = mockFetch.mock.calls[0][1].body as string;
     const tsField = Number(body.split(' ').pop());
     expect(tsField).toBe(ts.getTime());
+  });
+});
+
+describe('InfluxDbExporter InfluxDB v3 compatibility', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFetch.mockResolvedValue({ status: 204 });
+  });
+
+  // Measured against a real influxdb:3-core container: an unauthenticated
+  // GET /health answers 401 there, so the wizard reported a working v3 target
+  // as broken even though the write itself returned 204.
+  it('sends the token on the healthcheck', async () => {
+    mockFetch.mockResolvedValue({ ok: true, status: 200 });
+    const exporter = new InfluxDbExporter(defaultConfig);
+    const result = await exporter.healthcheck();
+
+    expect(result.success).toBe(true);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe('http://localhost:8086/health');
+    expect(init.headers.Authorization).toBe('Token my-token');
+  });
+
+  it('reports the healthcheck status when the token is rejected', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 401 });
+    const exporter = new InfluxDbExporter(defaultConfig);
+    const result = await exporter.healthcheck();
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('HTTP 401');
+  });
+
+  it('omits org from the write URL when it is not configured', async () => {
+    const { org: _org, ...withoutOrg } = defaultConfig;
+    const exporter = new InfluxDbExporter(withoutOrg as InfluxDbConfig);
+    await exporter.export(samplePayload);
+
+    const url = mockFetch.mock.calls[0][0] as string;
+    expect(url).not.toContain('org=');
+    expect(url).toBe('http://localhost:8086/api/v2/write?bucket=my-bucket&precision=ms');
+  });
+
+  it('omits org when it is configured as an empty string', async () => {
+    const exporter = new InfluxDbExporter({ ...defaultConfig, org: '' });
+    await exporter.export(samplePayload);
+
+    expect(mockFetch.mock.calls[0][0] as string).not.toContain('org=');
+  });
+
+  it('still sends org when configured, for v2', async () => {
+    const exporter = new InfluxDbExporter(defaultConfig);
+    await exporter.export(samplePayload);
+
+    expect(mockFetch.mock.calls[0][0] as string).toBe(
+      'http://localhost:8086/api/v2/write?org=my-org&bucket=my-bucket&precision=ms',
+    );
   });
 });

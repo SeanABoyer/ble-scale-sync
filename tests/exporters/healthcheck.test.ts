@@ -5,18 +5,15 @@ import { InfluxDbExporter } from '../../src/exporters/influxdb.js';
 import { NtfyExporter } from '../../src/exporters/ntfy.js';
 import { GarminExporter } from '../../src/exporters/garmin.js';
 import type { MqttConfig } from '../../src/exporters/config.js';
+import type { Exporter } from '../../src/interfaces/exporter.js';
 
-const { mockEndAsync, mockConnectAsync } = vi.hoisted(() => {
-  const mockEndAsync = vi.fn().mockResolvedValue(undefined);
-  const mockConnectAsync = vi.fn().mockResolvedValue({
-    publishAsync: vi.fn(),
-    endAsync: mockEndAsync,
-  });
-  return { mockEndAsync, mockConnectAsync };
+const { fakeMqtt } = await vi.hoisted(async () => {
+  const { createFakeMqtt } = await import('../helpers/fake-mqtt.js');
+  return { fakeMqtt: createFakeMqtt() };
 });
 
 vi.mock('mqtt', () => ({
-  connectAsync: mockConnectAsync,
+  connect: fakeMqtt.connect,
 }));
 
 const mockFetch = vi.fn();
@@ -25,11 +22,7 @@ vi.stubGlobal('fetch', mockFetch);
 describe('Exporter healthchecks', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockConnectAsync.mockResolvedValue({
-      publishAsync: vi.fn(),
-      endAsync: mockEndAsync,
-    });
-    mockEndAsync.mockResolvedValue(undefined);
+    fakeMqtt.reset();
   });
 
   describe('MqttExporter.healthcheck()', () => {
@@ -47,12 +40,12 @@ describe('Exporter healthchecks', () => {
       const exporter = new MqttExporter(config);
       const result = await exporter.healthcheck();
       expect(result.success).toBe(true);
-      expect(mockConnectAsync).toHaveBeenCalledTimes(1);
-      expect(mockEndAsync).toHaveBeenCalledTimes(1);
+      expect(fakeMqtt.connect).toHaveBeenCalledTimes(1);
+      expect(fakeMqtt.endAsync).toHaveBeenCalledTimes(1);
     });
 
     it('returns failure when connect fails', async () => {
-      mockConnectAsync.mockRejectedValue(new Error('connection refused'));
+      fakeMqtt.setBehaviour({ kind: 'error', error: new Error('connection refused') });
       const exporter = new MqttExporter(config);
       const result = await exporter.healthcheck();
       expect(result.success).toBe(false);
@@ -62,7 +55,7 @@ describe('Exporter healthchecks', () => {
     it('uses -healthcheck clientId suffix', async () => {
       const exporter = new MqttExporter(config);
       await exporter.healthcheck();
-      expect(mockConnectAsync).toHaveBeenCalledWith(
+      expect(fakeMqtt.connect).toHaveBeenCalledWith(
         'mqtt://localhost:1883',
         expect.objectContaining({ clientId: 'ble-scale-sync-healthcheck' }),
       );
@@ -119,7 +112,10 @@ describe('Exporter healthchecks', () => {
       const exporter = new InfluxDbExporter(config);
       const result = await exporter.healthcheck();
       expect(result.success).toBe(true);
+      // The token goes out even on v2, where /health is unauthenticated, so
+      // that v3 (which answers 401 without it) reports healthy too.
       expect(mockFetch).toHaveBeenCalledWith('http://localhost:8086/health', {
+        headers: { Authorization: 'Token my-token' },
         signal: expect.any(AbortSignal),
       });
     });
@@ -147,6 +143,7 @@ describe('Exporter healthchecks', () => {
       topic: 'my-scale',
       title: 'Scale Measurement',
       priority: 3,
+      reportExports: false,
     };
 
     it('calls /v1/health and returns success on 200', async () => {
@@ -180,7 +177,7 @@ describe('Exporter healthchecks', () => {
 
   describe('GarminExporter', () => {
     it('does not have healthcheck method', () => {
-      const exporter = new GarminExporter();
+      const exporter: Exporter = new GarminExporter();
       expect(exporter.healthcheck).toBeUndefined();
     });
   });

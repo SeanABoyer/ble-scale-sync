@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { OneByoneAdapter, OneByoneNewAdapter } from '../../src/scales/one-byone.js';
-import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
   defaultProfile,
+  makeConnectionContext,
   assertPayloadRanges,
 } from '../helpers/scale-test-utils.js';
-import { uuid16 } from '../../src/scales/body-comp-helpers.js';
+import { uuid16, WEIGHT_ONLY_HOLD_MS } from '../../src/scales/body-comp-helpers.js';
 
 // ─── OneByoneAdapter ─────────────────────────────────────────────────────────
 
@@ -75,12 +75,12 @@ describe('OneByoneAdapter', () => {
       const adapter = makeAdapter();
       const writeFn = vi.fn().mockResolvedValue(undefined);
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile: defaultProfile(),
-      };
+      });
 
       await adapter.onConnected!(ctx);
 
@@ -206,13 +206,13 @@ describe('OneByoneAdapter', () => {
 
     it('re-arms stability on reconnect', async () => {
       const adapter = makeAdapter();
-      const ctx = {
+      const ctx = makeConnectionContext({
         write: async () => {},
         read: async () => Buffer.alloc(0),
         subscribe: async () => {},
         profile: defaultProfile(),
         deviceAddress: 'AA:BB:CC:DD:EE:FF',
-      };
+      });
 
       adapter.parseNotification(cfFrame(80));
       expect(adapter.isFinal!(adapter.parseNotification(cfFrame(80))!)).toBe(true);
@@ -349,9 +349,30 @@ describe('OneByoneNewAdapter', () => {
       expect(adapter.isComplete({ weight: 0, impedance: 500 })).toBe(false);
     });
 
-    it('returns false when impedance is 0', () => {
+    it('completes a final weight without impedance after a short hold (D-07, D028)', () => {
+      // The 0x80 final weight of a weigh-in the scale could not analyse (socks,
+      // a child) is never followed by a 0x01 impedance frame. It used to be
+      // refused for good, so the session timed out and the weight was lost.
       const adapter = makeAdapter();
-      expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(false);
+      const wBuf = Buffer.alloc(6);
+      wBuf[0] = 0xab;
+      wBuf[1] = 0x2a;
+      wBuf[2] = 0x80;
+      const raw = 80000;
+      wBuf[3] = (raw >> 16) & 0xff;
+      wBuf[4] = (raw >> 8) & 0xff;
+      wBuf[5] = raw & 0xff;
+      const reading = adapter.parseNotification(wBuf)!;
+
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal!(reading)).toBe(false);
+      expect(adapter.completionHoldMs).toBe(WEIGHT_ONLY_HOLD_MS);
+    });
+
+    it('resolves at once when the impedance frame arrives', () => {
+      const adapter = makeAdapter();
+      expect(adapter.isFinal!({ weight: 80, impedance: 500 })).toBe(true);
+      expect(adapter.isComplete({ weight: 80, impedance: 500 })).toBe(true);
     });
   });
 
@@ -370,5 +391,120 @@ describe('OneByoneNewAdapter', () => {
       const payload = adapter.computeMetrics({ weight: 0, impedance: 0 }, profile);
       expect(payload.weight).toBe(0);
     });
+  });
+});
+
+// #386: this adapter parses an impedance out of the scale's frames and used to
+// hand buildPayload an empty comp, so the exported body fat was the Deurenberg
+// BMI estimate and the impedance was published but ignored.
+//
+// At 80 kg / 183 cm / 30 / male the two answers are far apart, which is the
+// point: 19.37 % from BMI alone, 25.06 % from a 500 ohm BIA reading.
+describe('1byone / Eufy BIA from the parsed impedance (#386)', () => {
+  const BMI_ONLY_FAT = 19.37;
+  const BIA_FAT_AT_500 = 25.06;
+
+  it('computes body fat from a plausible impedance instead of from BMI', () => {
+    const payload = new OneByoneAdapter().computeMetrics(
+      { weight: 80, impedance: 500 },
+      defaultProfile(),
+    );
+    expect(payload.bodyFatPercent).toBeCloseTo(BIA_FAT_AT_500, 1);
+    expect(payload.impedance).toBe(500);
+  });
+
+  it('moves every derived field with it, not just the fat percentage', () => {
+    const payload = new OneByoneAdapter().computeMetrics(
+      { weight: 80, impedance: 500 },
+      defaultProfile(),
+    );
+    expect(payload.physiqueRating).toBe(2);
+    expect(payload.visceralFat).toBe(12);
+    expect(payload.waterPercent).toBeCloseTo(54.7, 2);
+  });
+
+  it('falls back to the BMI estimate when the impedance is not a body', () => {
+    // 50 is what this adapter's own synthetic fixture produces from a raw
+    // 500, because of the `* 0.1` it inherited from openScale. If that factor
+    // is wrong, a real body lands here and is refused rather than published as
+    // a 4 % body fat.
+    for (const impedance of [1, 149, 1201, 65535]) {
+      const payload = new OneByoneAdapter().computeMetrics(
+        { weight: 80, impedance },
+        defaultProfile(),
+      );
+      expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
+    }
+  });
+
+  it('still falls back when no impedance was measured at all', () => {
+    const payload = new OneByoneAdapter().computeMetrics(
+      { weight: 80, impedance: 0 },
+      defaultProfile(),
+    );
+    expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
+  });
+});
+
+// #386: this adapter parses an impedance out of the scale's frames and used to
+// hand buildPayload an empty comp, so the exported body fat was the Deurenberg
+// BMI estimate and the impedance was published but ignored.
+//
+// At 80 kg / 183 cm / 30 / male the two answers are far apart, which is the
+// point: 19.37 % from BMI alone, 25.06 % from a 500 ohm BIA reading.
+describe('1byone Scale (new protocol) BIA from the parsed impedance (#386)', () => {
+  const BMI_ONLY_FAT = 19.37;
+  const BIA_FAT_AT_500 = 25.06;
+
+  it('computes body fat from a plausible impedance instead of from BMI', () => {
+    const payload = new OneByoneNewAdapter().computeMetrics(
+      { weight: 80, impedance: 500 },
+      defaultProfile(),
+    );
+    expect(payload.bodyFatPercent).toBeCloseTo(BIA_FAT_AT_500, 1);
+    expect(payload.impedance).toBe(500);
+  });
+
+  it('moves every derived field with it, not just the fat percentage', () => {
+    const payload = new OneByoneNewAdapter().computeMetrics(
+      { weight: 80, impedance: 500 },
+      defaultProfile(),
+    );
+    expect(payload.physiqueRating).toBe(2);
+    expect(payload.visceralFat).toBe(12);
+    expect(payload.waterPercent).toBeCloseTo(54.7, 2);
+  });
+
+  it('falls back to the BMI estimate when the impedance is not a body', () => {
+    for (const impedance of [1, 149, 1201, 65535]) {
+      const payload = new OneByoneNewAdapter().computeMetrics(
+        { weight: 80, impedance },
+        defaultProfile(),
+      );
+      expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
+    }
+  });
+
+  it('still falls back when no impedance was measured at all', () => {
+    const payload = new OneByoneNewAdapter().computeMetrics(
+      { weight: 80, impedance: 0 },
+      defaultProfile(),
+    );
+    expect(payload.bodyFatPercent).toBeCloseTo(BMI_ONLY_FAT, 1);
+  });
+});
+
+describe('1byone / Eufy: the 0.1 factor and the band (#386)', () => {
+  it('refuses a 50 ohm reading, which is what raw 500 decodes to here', () => {
+    // Not a hypothetical: tests above assert exactly 50.0 from raw 500. A body
+    // does not read 50 ohm, so either the factor is wrong or that fixture is
+    // not a real frame. Either way it must not drive a body composition.
+    const payload = new OneByoneAdapter().computeMetrics(
+      { weight: 80, impedance: 50 },
+      defaultProfile(),
+    );
+    expect(payload.bodyFatPercent).toBeCloseTo(19.37, 1);
+    // The number is still published; it is only refused as a BIA input.
+    expect(payload.impedance).toBe(50);
   });
 });

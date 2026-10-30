@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   BlueZPairingAgent,
-  registerPairingAgent,
   ensurePairingAgent,
   setPairingTarget,
   forgetPairingAgent,
@@ -18,47 +17,95 @@ beforeEach(() => {
   vi.spyOn(bleLog, 'info').mockImplementation(() => {});
 });
 
+/** The scale every callback test pairs with; the agent only serves this one. */
+const SCALE = 'D8:0B:CB:5B:B6:58';
+const SCALE_PATH = '/org/bluez/hci0/dev_D8_0B_CB_5B_B6_58';
+
 describe('BlueZPairingAgent callbacks', () => {
   it('RequestPasskey returns the configured PIN as a number', () => {
     const agent = new BlueZPairingAgent();
-    agent.setPinProvider(() => 3752);
-    expect(agent.RequestPasskey('/org/bluez/hci0/dev_X')).toBe(3752);
+    agent.setTargetProvider(() => ({ pin: 3752, mac: SCALE }));
+    expect(agent.RequestPasskey(SCALE_PATH)).toBe(3752);
   });
 
   it('RequestPinCode returns the PIN as a string', () => {
     const agent = new BlueZPairingAgent();
-    agent.setPinProvider(() => 3752);
-    expect(agent.RequestPinCode('/org/bluez/hci0/dev_X')).toBe('3752');
+    agent.setTargetProvider(() => ({ pin: 3752, mac: SCALE }));
+    expect(agent.RequestPinCode(SCALE_PATH)).toBe('3752');
   });
 
   it('reflects a refreshed PIN provider (config reload)', () => {
     const agent = new BlueZPairingAgent();
-    agent.setPinProvider(() => 1111);
-    expect(agent.RequestPasskey('/d')).toBe(1111);
-    agent.setPinProvider(() => 2222);
-    expect(agent.RequestPasskey('/d')).toBe(2222);
+    agent.setTargetProvider(() => ({ pin: 1111, mac: SCALE }));
+    expect(agent.RequestPasskey(SCALE_PATH)).toBe(1111);
+    agent.setTargetProvider(() => ({ pin: 2222, mac: SCALE }));
+    expect(agent.RequestPasskey(SCALE_PATH)).toBe(2222);
   });
 
   it('rejects passkey/pin requests when no PIN is configured', () => {
     const agent = new BlueZPairingAgent();
-    agent.setPinProvider(() => undefined);
-    expect(() => agent.RequestPasskey('/d')).toThrow(/beurer_pin/);
-    expect(() => agent.RequestPinCode('/d')).toThrow(/beurer_pin/);
+    agent.setTargetProvider(() => ({ pin: undefined, mac: SCALE }));
+    expect(() => agent.RequestPasskey(SCALE_PATH)).toThrow(/beurer_pin/);
+    expect(() => agent.RequestPinCode(SCALE_PATH)).toThrow(/beurer_pin/);
   });
 
-  it('accepts the confirmation/authorization models without throwing', () => {
+  describe('log lines (#430)', () => {
+    const DEV = '/org/bluez/hci0/dev_D8_0B_CB_5B_B6_58';
+
+    it('RequestPasskey without a PIN points at a manual pairing, not at beurer_pin', () => {
+      const agent = new BlueZPairingAgent();
+      agent.setTargetProvider(() => ({ pin: undefined, mac: SCALE }));
+      expect(() => agent.RequestPasskey(DEV)).toThrow();
+
+      const msg = String(vi.mocked(bleLog.warn).mock.calls.at(-1)?.[0]);
+      expect(msg).toContain('bluetoothctl');
+      expect(msg).toContain('new on every attempt');
+      expect(msg).toContain('pair D8:0B:CB:5B:B6:58');
+      expect(msg).not.toContain('the code the scale was paired with');
+    });
+
+    it('RequestPinCode without a PIN names the PIN code and the manual pairing', () => {
+      const agent = new BlueZPairingAgent();
+      agent.setTargetProvider(() => ({ pin: undefined, mac: SCALE }));
+      expect(() => agent.RequestPinCode(DEV)).toThrow();
+
+      const msg = String(vi.mocked(bleLog.warn).mock.calls.at(-1)?.[0]);
+      expect(msg).toContain('PIN code');
+      expect(msg).toContain('bluetoothctl');
+    });
+
+    it('says at info that it answered with beurer_pin, without logging the PIN', () => {
+      const agent = new BlueZPairingAgent();
+      agent.setTargetProvider(() => ({ pin: 3752, mac: SCALE }));
+      expect(agent.RequestPasskey(DEV)).toBe(3752);
+
+      const lines = vi.mocked(bleLog.info).mock.calls.map((c) => String(c[0]));
+      const line = lines.find((l) => l.includes('beurer_pin'));
+      expect(line).toBeDefined();
+      expect(line).toContain('RequestPasskey');
+      const everything = [
+        ...lines,
+        ...vi.mocked(bleLog.debug).mock.calls.map((c) => String(c[0])),
+        ...vi.mocked(bleLog.warn).mock.calls.map((c) => String(c[0])),
+      ];
+      expect(everything.some((l) => l.includes('3752'))).toBe(false);
+    });
+  });
+
+  it('accepts the confirmation/authorization models for the scale without throwing', () => {
     const agent = new BlueZPairingAgent();
-    expect(() => agent.RequestConfirmation('/d', 123456)).not.toThrow();
-    expect(() => agent.RequestAuthorization('/d')).not.toThrow();
+    agent.setTargetProvider(() => ({ pin: 3752, mac: SCALE }));
+    expect(() => agent.RequestConfirmation(SCALE_PATH, 123456)).not.toThrow();
+    expect(() => agent.RequestAuthorization(SCALE_PATH)).not.toThrow();
     expect(() =>
-      agent.AuthorizeService('/d', '0000181d-0000-1000-8000-00805f9b34fb'),
+      agent.AuthorizeService(SCALE_PATH, '0000181d-0000-1000-8000-00805f9b34fb'),
     ).not.toThrow();
   });
 
   it('display/lifecycle callbacks do not throw', () => {
     const agent = new BlueZPairingAgent();
-    expect(() => agent.DisplayPasskey('/d', 123456, 0)).not.toThrow();
-    expect(() => agent.DisplayPinCode('/d', '123456')).not.toThrow();
+    expect(() => agent.DisplayPasskey(SCALE_PATH, 123456, 0)).not.toThrow();
+    expect(() => agent.DisplayPinCode(SCALE_PATH, '123456')).not.toThrow();
     expect(() => agent.Release()).not.toThrow();
     expect(() => agent.Cancel()).not.toThrow();
   });
@@ -85,11 +132,15 @@ function fakeBus(manager: Partial<FakeManager> = {}, getProxyImpl?: () => Promis
   };
 }
 
-describe('registerPairingAgent', () => {
+// registerPairingAgent was removed: it installed a PIN-only provider that
+// dropped the MAC gate (#83). The same registration contract, on the one
+// entry point left.
+describe('ensurePairingAgent registration', () => {
   it('exports the agent and registers it with KeyboardDisplay capability', async () => {
     const { bus, mgr } = fakeBus();
+    setPairingTarget(() => ({ pin: 3752, mac: SCALE }));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await registerPairingAgent(bus as any, () => 3752);
+    await ensurePairingAgent(bus as any);
     expect(bus.export).toHaveBeenCalledWith(AGENT_PATH, expect.anything());
     expect(mgr.RegisterAgent).toHaveBeenCalledWith(AGENT_PATH, AGENT_CAPABILITY);
     expect(mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
@@ -98,19 +149,19 @@ describe('registerPairingAgent', () => {
   it('is idempotent: a second call does not re-export', async () => {
     const { bus } = fakeBus();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await registerPairingAgent(bus as any, () => 1);
+    await ensurePairingAgent(bus as any);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await registerPairingAgent(bus as any, () => 2);
+    await ensurePairingAgent(bus as any);
     expect(bus.export).toHaveBeenCalledTimes(1);
   });
 
   it('re-exports after forgetPairingAgent', async () => {
     const { bus } = fakeBus();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await registerPairingAgent(bus as any, () => 1);
+    await ensurePairingAgent(bus as any);
     forgetPairingAgent();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await registerPairingAgent(bus as any, () => 1);
+    await ensurePairingAgent(bus as any);
     expect(bus.export).toHaveBeenCalledTimes(2);
   });
 
@@ -120,8 +171,9 @@ describe('registerPairingAgent', () => {
         throw new Error('org.bluez.Error.AlreadyExists: Already Exists');
       }),
     });
+    setPairingTarget(() => ({ pin: 1, mac: SCALE }));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect(registerPairingAgent(bus as any, () => 1)).resolves.toBeUndefined();
+    await expect(ensurePairingAgent(bus as any)).resolves.toBeUndefined();
     expect(mgr.RequestDefaultAgent).toHaveBeenCalled();
   });
 
@@ -134,7 +186,7 @@ describe('registerPairingAgent', () => {
       }),
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await expect(registerPairingAgent(bus as any, () => 1)).resolves.toBeUndefined();
+    await expect(ensurePairingAgent(bus as any)).resolves.toBeUndefined();
     expect(bus.unexport).toHaveBeenCalledWith(AGENT_PATH, expect.anything());
   });
 });
@@ -165,6 +217,135 @@ describe('ensurePairingAgent (#83)', () => {
     expect(noPin.mgr.RegisterAgent).toHaveBeenCalled();
     // Never take the system-wide role we cannot honour without a PIN.
     expect(noPin.mgr.RequestDefaultAgent).not.toHaveBeenCalled();
+  });
+
+  // #408: a scale that keeps a single Just Works bond, paired without a PIN.
+  it('claims the default-agent role without a PIN only for a single-bond pairing', async () => {
+    const { bus, mgr } = fakeBus();
+    setPairingTarget(() => ({ mac: SCALE }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(bus as any);
+    expect(mgr.RequestDefaultAgent).not.toHaveBeenCalled();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(bus as any, { forPairing: true });
+    expect(mgr.RequestDefaultAgent).toHaveBeenCalledTimes(1);
+    expect(mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
+    expect(bus.export).toHaveBeenCalledTimes(1);
+  });
+
+  // A call still out on a replaced connection fails only after resetConnection()
+  // has forgotten the agent: connection.ts rejects it with Disconnected once the
+  // old bus ends. That failure must not latch the role away from the new bus.
+  it('a default-agent request failing on a replaced connection does not latch the new one', async () => {
+    setPairingTarget(() => ({ pin: 1234, mac: SCALE }));
+    let failOld!: (e: unknown) => void;
+    const old = fakeBus({
+      RequestDefaultAgent: vi.fn(() => new Promise<void>((_r, rej) => (failOld = rej))),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pendingOld = ensurePairingAgent(old.bus as any);
+    await vi.waitFor(() => expect(old.mgr.RequestDefaultAgent).toHaveBeenCalledTimes(1));
+
+    forgetPairingAgent();
+    failOld(new Error('org.freedesktop.DBus.Error.Disconnected: D-Bus connection closed'));
+    await pendingOld;
+
+    const fresh = fakeBus();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(fresh.bus as any);
+    expect(fresh.mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
+    expect(bleLog.warn).not.toHaveBeenCalled();
+  });
+
+  it('a registration failing on a replaced connection warns about nothing and keeps the new one clean', async () => {
+    setPairingTarget(() => ({ pin: 1234, mac: SCALE }));
+    let failOld!: (e: unknown) => void;
+    const old = fakeBus({
+      RegisterAgent: vi.fn(() => new Promise<void>((_r, rej) => (failOld = rej))),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pendingOld = ensurePairingAgent(old.bus as any);
+    await vi.waitFor(() => expect(old.mgr.RegisterAgent).toHaveBeenCalledTimes(1));
+
+    forgetPairingAgent();
+    failOld(new Error('org.freedesktop.DBus.Error.Disconnected: D-Bus connection closed'));
+    await pendingOld;
+
+    const fresh = fakeBus();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(fresh.bus as any);
+    expect(fresh.mgr.RegisterAgent).toHaveBeenCalledWith(AGENT_PATH, AGENT_CAPABILITY);
+    expect(fresh.mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
+    expect(bleLog.warn).not.toHaveBeenCalled();
+  });
+
+  it('a late success on a replaced connection does not mark the new one registered', async () => {
+    setPairingTarget(() => ({ pin: 1234, mac: SCALE }));
+    let answerOld!: () => void;
+    const old = fakeBus({
+      RegisterAgent: vi.fn(() => new Promise<void>((r) => (answerOld = r))),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pendingOld = ensurePairingAgent(old.bus as any);
+    await vi.waitFor(() => expect(old.mgr.RegisterAgent).toHaveBeenCalledTimes(1));
+
+    forgetPairingAgent();
+    answerOld();
+    await pendingOld;
+    expect(old.mgr.RequestDefaultAgent).not.toHaveBeenCalled();
+
+    const fresh = fakeBus();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(fresh.bus as any);
+    expect(fresh.bus.export).toHaveBeenCalledWith(AGENT_PATH, expect.anything());
+    expect(fresh.mgr.RegisterAgent).toHaveBeenCalledWith(AGENT_PATH, AGENT_CAPABILITY);
+  });
+
+  // The answer can already sit in the socket when resetConnection() runs, and
+  // dbus-next hands it over before the end, so after forgetPairingAgent().
+  it('a late default-agent success on a replaced connection leaves the role to the new one', async () => {
+    setPairingTarget(() => ({ pin: 1234, mac: SCALE }));
+    let answerOld!: () => void;
+    const old = fakeBus({
+      RequestDefaultAgent: vi.fn(() => new Promise<void>((r) => (answerOld = r))),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pendingOld = ensurePairingAgent(old.bus as any);
+    await vi.waitFor(() => expect(old.mgr.RequestDefaultAgent).toHaveBeenCalledTimes(1));
+
+    forgetPairingAgent();
+    answerOld();
+    await pendingOld;
+
+    const fresh = fakeBus();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(fresh.bus as any);
+    expect(fresh.mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
+  });
+
+  // The new connection can set its agent up before the old bus ends: the
+  // daemon closes its side only after our stream.end(). The old call failing
+  // then belongs to the old agent instance, not to whichever came after it.
+  it('an old call failing after the new connection set up its agent leaves the new one alone', async () => {
+    setPairingTarget(() => ({ pin: 1234, mac: SCALE }));
+    let failOld!: (e: unknown) => void;
+    const old = fakeBus({
+      RequestDefaultAgent: vi.fn(() => new Promise<void>((_r, rej) => (failOld = rej))),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pendingOld = ensurePairingAgent(old.bus as any);
+    await vi.waitFor(() => expect(old.mgr.RequestDefaultAgent).toHaveBeenCalledTimes(1));
+
+    forgetPairingAgent();
+    const fresh = fakeBus();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ensurePairingAgent(fresh.bus as any);
+    failOld(new Error('org.freedesktop.DBus.Error.Disconnected: D-Bus connection closed'));
+    await pendingOld;
+
+    expect(fresh.mgr.RequestDefaultAgent).toHaveBeenCalledWith(AGENT_PATH);
+    expect(bleLog.warn).not.toHaveBeenCalled();
   });
 
   it('claims the default-agent role later if a PIN appears after a reload', async () => {
@@ -205,9 +386,15 @@ describe('pairing agent MAC scoping (#83)', () => {
     expect(() => agent.AuthorizeService(OTHER, '0000180a-0000-1000-8000-00805f9b34fb')).toThrow();
   });
 
-  it('serves any device when no scale_mac is configured (auto-discovery)', () => {
+  // This used to serve ANY device: with a PIN set the agent holds the default
+  // role, so every incoming pairing in radio range reached it and was accepted
+  // and handed the PIN. Auto-discovery now supplies the matched address once
+  // the scan finds the scale; before that nothing legitimate asks.
+  it('declines every device while no scale is identified (auto-discovery)', () => {
     const agent = agentFor(undefined);
-    expect(agent.RequestPasskey(OTHER)).toBe(1894);
-    expect(() => agent.RequestConfirmation(OTHER, 1)).not.toThrow();
+    expect(() => agent.RequestPasskey(OTHER)).toThrow();
+    expect(() => agent.RequestConfirmation(OTHER, 1)).toThrow();
+    expect(() => agent.RequestAuthorization(OTHER)).toThrow();
+    expect(() => agent.AuthorizeService(OTHER, '00001124-0000-1000-8000-00805f9b34fb')).toThrow();
   });
 });

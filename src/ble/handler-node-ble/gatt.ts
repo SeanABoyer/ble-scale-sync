@@ -1,5 +1,5 @@
 import type NodeBle from 'node-ble';
-import type { BleChar, BleDevice } from '../shared.js';
+import type { BleChar, BleDevice } from '../session/ports.js';
 import { bleLog, normalizeUuid, errMsg } from '../types.js';
 import type { Device } from './dbus.js';
 
@@ -22,14 +22,35 @@ export function wrapChar(char: GattCharacteristic): BleChar {
       }
     },
     read: () => char.readValue(),
+    // BlueZ StopNotify writes the CCCD back to 0 itself. A direct write to the
+    // CCC descriptor is refused by BlueZ, so this is the only way to do it.
+    stop: () => char.stopNotifications(),
   };
 }
 
 export function wrapDevice(device: Device): BleDevice {
+  let disconnectCb: (() => void) | undefined;
+  let fired = false;
+  const fireDisconnect = (): void => {
+    if (fired || !disconnectCb) return;
+    fired = true;
+    disconnectCb();
+  };
+
   return {
     onDisconnect: (callback) => {
-      device.on('disconnect', callback);
+      disconnectCb = callback;
+      // `once`, not `on`: the session ends on the first disconnect, and a
+      // second one would only re-enter a settled promise while keeping the
+      // closure reachable for the proxy's lifetime.
+      device.once('disconnect', fireDisconnect);
     },
+    // node-ble's own Device.disconnect() calls helper.removeListeners()
+    // immediately after issuing the D-Bus call, and 'disconnect' is emitted
+    // from a PropertiesChanged handler that removal drops. So on this transport
+    // the event never arrives for a disconnect WE initiate, and a session torn
+    // down by a timeout would never clean up (#404).
+    fireDisconnect,
   };
 }
 

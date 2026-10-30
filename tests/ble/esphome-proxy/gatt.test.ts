@@ -1,9 +1,22 @@
 import { describe, it, expect, vi } from 'vitest';
 import { openGattSession } from '../../../src/ble/handler-esphome-proxy/gatt.js';
-import { normalizeUuid } from '../../../src/ble/types.js';
+import { bleLog, normalizeUuid } from '../../../src/ble/types.js';
 
 // macToInt('00:00:00:00:00:01') === 1
 const ADDR = 1;
+
+// Typed for the shapes tests swap in: a failed connect has no mtu, a malformed
+// characteristic no uuid.
+type GattChar = {
+  uuid?: string;
+  handle: number;
+  properties: number;
+  descriptorsList: { uuid: string; handle: number }[];
+};
+type GattServices = {
+  address: number;
+  servicesList: { uuid: string; handle: number; characteristicsList: GattChar[] }[];
+};
 
 function fakeConnection() {
   const listeners: Record<string, Array<(a: unknown) => void>> = {};
@@ -22,12 +35,21 @@ function fakeConnection() {
     emit(ev: string, a: unknown) {
       (listeners[ev] ?? []).forEach((f) => f(a));
     },
-    connectBluetoothDeviceService: vi.fn(async () => ({ address: ADDR, connected: true, mtu: 23 })),
+    connectBluetoothDeviceService: vi.fn(
+      async (
+        _addr: number,
+        _type?: number,
+      ): Promise<{ address: number; connected: boolean; mtu?: number }> => ({
+        address: ADDR,
+        connected: true,
+        mtu: 23,
+      }),
+    ),
     disconnectBluetoothDeviceService: vi.fn(async () => ({ address: ADDR, connected: false })),
     // Shape as emitted by @2colors/esphome-native-api 1.3.6: mapMessageByType()
     // pre-decodes the GATT uuid uint64 pair into a `uuid` string and DROPS
     // `uuidList`. The bridge must read `uuid`, not the (now absent) `uuidList`.
-    listBluetoothGATTServicesService: vi.fn(async () => ({
+    listBluetoothGATTServicesService: vi.fn(async (): Promise<GattServices> => ({
       address: ADDR,
       servicesList: [
         {
@@ -67,7 +89,9 @@ function fakeConnection() {
     })),
     // Real library shape: protobuf-JS renders `bytes data` as base64 (#291).
     readBluetoothGATTCharacteristicService: vi.fn(async () => ({ data: 'AQID' })),
-    writeBluetoothGATTCharacteristicService: vi.fn(async () => ({})),
+    writeBluetoothGATTCharacteristicService: vi.fn(
+      async (_addr: number, _handle: number, _data: Uint8Array, _response: boolean) => ({}),
+    ),
     notifyBluetoothGATTCharacteristicService: vi.fn(async () => ({})),
     writeBluetoothGATTDescriptorService: vi.fn(async () => ({})),
   };
@@ -337,8 +361,11 @@ describe('openGattSession', () => {
     const first = char.write(Buffer.from([1]), true);
     const queued = [2, 3, 4].map((b) => char.write(Buffer.from([b]), true).catch(() => 'rejected'));
     await new Promise((r) => setTimeout(r, 5));
-    await session.close();
+    // close() queues its disconnect behind the request already in flight on the
+    // shared connection (B-04), so it settles once that write is answered.
+    const closing = session.close();
     release?.();
+    await closing;
     await first.catch(() => undefined);
     await Promise.all(queued);
     // Only the in-flight write reached the connection; the backlog rejected
@@ -349,6 +376,56 @@ describe('openGattSession', () => {
   it('fires BleDevice.onDisconnect when the peer reports disconnected', async () => {
     const conn = fakeConnection();
     const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const onDis = vi.fn();
+    session.device.onDisconnect(onDis);
+    conn.emit('message.BluetoothDeviceConnectionResponse', { address: ADDR, connected: false });
+    expect(onDis).toHaveBeenCalledTimes(1);
+    await session.close();
+  });
+
+  // fireDisconnect() is what lets a caller that gave up on a timeout tell the
+  // abandoned waitForRawReading to tear itself down. Without it the wait keeps
+  // its notify unsubscribers and its unlock interval forever and never calls
+  // the adapter's onSessionEnd, because on this transport the disconnect
+  // callback is driven purely by the proxy's connection frames - and a proxy
+  // that dropped off Wi-Fi sends none.
+  it('fireDisconnect() invokes the disconnect callback without a peer frame', async () => {
+    const conn = fakeConnection();
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const onDis = vi.fn();
+    session.device.onDisconnect(onDis);
+
+    session.device.fireDisconnect();
+    expect(onDis).toHaveBeenCalledTimes(1);
+
+    // A real frame arriving afterwards must not double-fire it.
+    conn.emit('message.BluetoothDeviceConnectionResponse', { address: ADDR, connected: false });
+    expect(onDis).toHaveBeenCalledTimes(1);
+    await session.close();
+  });
+
+  it('fireDisconnect() is idempotent and survives the reverse order', async () => {
+    const conn = fakeConnection();
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    const onDis = vi.fn();
+    session.device.onDisconnect(onDis);
+
+    conn.emit('message.BluetoothDeviceConnectionResponse', { address: ADDR, connected: false });
+    session.device.fireDisconnect();
+    session.device.fireDisconnect();
+    expect(onDis).toHaveBeenCalledTimes(1);
+    await session.close();
+  });
+
+  // The latch must not close over an empty slot: a fireDisconnect() before any
+  // onDisconnect() would otherwise swallow the REAL disconnect frame for the
+  // callback registered afterwards.
+  it('fireDisconnect() before onDisconnect() does not swallow the real frame', async () => {
+    const conn = fakeConnection();
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+
+    session.device.fireDisconnect();
+
     const onDis = vi.fn();
     session.device.onDisconnect(onDis);
     conn.emit('message.BluetoothDeviceConnectionResponse', { address: ADDR, connected: false });
@@ -387,5 +464,116 @@ describe('openGattSession', () => {
     expect(conn.connectBluetoothDeviceService).toHaveBeenNthCalledWith(2, ADDR, 1);
     expect(session.charMap.has(normalizeUuid('2a9d'))).toBe(true);
     await session.close();
+  });
+
+  it('releases the proxy link when service discovery fails after connecting (B-03)', async () => {
+    const conn = fakeConnection();
+    // The library's 5 s wait for BluetoothGATTGetServicesDoneResponse ran out,
+    // but the proxy is still connected to the scale and holds a slot for it.
+    conn.listBluetoothGATTServicesService = vi.fn(async () => {
+      throw new Error('sendMessage timeout waiting for BluetoothGATTGetServicesDoneResponse');
+    });
+    await expect(
+      openGattSession({ connection: conn } as never, '00:00:00:00:00:01', 0),
+    ).rejects.toThrow(/GetServicesDoneResponse/);
+    expect(conn.disconnectBluetoothDeviceService).toHaveBeenCalledWith(ADDR);
+  });
+
+  it('cancels an unanswered connect before trying the other address type (B-03)', async () => {
+    const conn = fakeConnection();
+    const calls: string[] = [];
+    conn.connectBluetoothDeviceService = vi.fn(async (_addr: number, type?: number) => {
+      calls.push(`connect:${type}`);
+      if (type === 0)
+        throw new Error('sendMessage timeout waiting for BluetoothDeviceConnectionResponse');
+      return { address: ADDR, connected: true, mtu: 23 };
+    });
+    conn.disconnectBluetoothDeviceService = vi.fn(async () => {
+      calls.push('disconnect');
+      return { address: ADDR, connected: false };
+    });
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    // ESPHome keeps a timed-out attempt running and ignores a second connect
+    // request for the same address while it does, so it must be cancelled first.
+    expect(calls).toEqual(['connect:0', 'disconnect', 'connect:1']);
+    await session.close();
+  });
+
+  it('does not take a connection response for another device as its own (B-04)', async () => {
+    const conn = fakeConnection();
+    // An unsolicited "disconnected" for a different scale on the same proxy
+    // resolves the library's uncorrelated wait for our connect response.
+    conn.connectBluetoothDeviceService = vi
+      .fn()
+      .mockResolvedValueOnce({ address: 2, connected: true, mtu: 23 })
+      .mockResolvedValueOnce({ address: ADDR, connected: true, mtu: 23 });
+    const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+    expect(conn.connectBluetoothDeviceService).toHaveBeenCalledTimes(2);
+    await session.close();
+  });
+
+  describe('notify handle logging (#331, #291)', () => {
+    const NOTIFY = 'message.BluetoothGATTNotifyDataResponse';
+    const unownedLines = (debug: { mock: { calls: unknown[][] } }): string[] =>
+      debug.mock.calls.map((c) => String(c[0])).filter((l) => /mismatch|did not subscribe/.test(l));
+
+    it('does not log a notification another subscribed characteristic owns', async () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      try {
+        const conn = fakeConnection();
+        const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+        const a: Buffer[] = [];
+        const b: Buffer[] = [];
+        await session.charMap.get(normalizeUuid('2a9d'))!.subscribe((d) => a.push(d));
+        await session.charMap.get(normalizeUuid('2a9c'))!.subscribe((d) => b.push(d));
+        conn.emit(NOTIFY, { address: ADDR, handle: 7, data: 'qg==' });
+        conn.emit(NOTIFY, { address: ADDR, handle: 9, data: 'uw==' });
+        expect(a).toEqual([Buffer.from([0xaa])]);
+        expect(b).toEqual([Buffer.from([0xbb])]);
+        expect(unownedLines(debug)).toEqual([]);
+        await session.close();
+      } finally {
+        debug.mockRestore();
+      }
+    });
+
+    it('logs a handle nobody subscribed to once per session', async () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      try {
+        const conn = fakeConnection();
+        const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+        await session.charMap.get(normalizeUuid('2a9d'))!.subscribe(() => {});
+        await session.charMap.get(normalizeUuid('2a9c'))!.subscribe(() => {});
+        conn.emit(NOTIFY, { address: ADDR, handle: 0x63, data: 'qg==' });
+        conn.emit(NOTIFY, { address: ADDR, handle: 0x63, data: 'qg==' });
+        const lines = unownedLines(debug);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain('0x63');
+        await session.close();
+      } finally {
+        debug.mockRestore();
+      }
+    });
+
+    it('keeps a handle owned while a second listener on it is still subscribed (#75)', async () => {
+      const debug = vi.spyOn(bleLog, 'debug').mockImplementation(() => {});
+      try {
+        const conn = fakeConnection();
+        const session = await openGattSession({ connection: conn } as never, '00:00:00:00:00:01');
+        const char = session.charMap.get(normalizeUuid('2a9d'))!;
+        const got: Buffer[] = [];
+        const first = await char.subscribe(() => {});
+        await char.subscribe((d) => got.push(d));
+        await session.charMap.get(normalizeUuid('2a9c'))!.subscribe(() => {});
+        first();
+        first();
+        conn.emit(NOTIFY, { address: ADDR, handle: 7, data: 'qg==' });
+        expect(got).toEqual([Buffer.from([0xaa])]);
+        expect(unownedLines(debug)).toEqual([]);
+        await session.close();
+      } finally {
+        debug.mockRestore();
+      }
+    });
   });
 });

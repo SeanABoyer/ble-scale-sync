@@ -1,5 +1,5 @@
 import noble from '@abandonware/noble';
-import { createNobleHandler, type NobleApi } from './handler-noble-shared.js';
+import { createNobleHandler, type NobleApi } from './handler-noble-shared/index.js';
 
 /**
  * BLE handler backed by `@abandonware/noble` (Windows default; mature driver).
@@ -16,6 +16,5 @@ const handler = createNobleHandler({
 });
 
 export const scanAndReadRaw = handler.scanAndReadRaw;
-export const scanAndRead = handler.scanAndRead;
 export const scanDevices = handler.scanDevices;
 export const _internals = handler._internals;

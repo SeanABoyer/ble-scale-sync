@@ -4,8 +4,7 @@ import type { Exporter, ExportContext, ExportResult } from '../interfaces/export
 import type { ExporterSchema } from '../interfaces/exporter-schema.js';
 import type { TelegramConfig } from './config.js';
 import { formatNotification } from './notification-message.js';
-import { withRetry, httpError } from '../utils/retry.js';
-import { errMsg } from '../utils/error.js';
+import { sendWithRetry, probe } from './http.js';
 
 const log = createLogger('Telegram');
 
@@ -68,21 +67,11 @@ export class TelegramExporter implements Exporter {
   }
 
   async healthcheck(): Promise<ExportResult> {
-    try {
-      // getChat validates both the bot token and that the bot can reach the chat.
-      const url = `${API_BASE}/bot${this.config.botToken}/getChat?chat_id=${encodeURIComponent(
-        this.config.chatId,
-      )}`;
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) {
-        return { success: false, error: `HTTP ${response.status}` };
-      }
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    // getChat validates both the bot token and that the bot can reach the chat.
+    const url = `${API_BASE}/bot${this.config.botToken}/getChat?chat_id=${encodeURIComponent(
+      this.config.chatId,
+    )}`;
+    return probe(url);
   }
 
   async export(data: BodyComposition, context?: ExportContext): Promise<ExportResult> {
@@ -90,27 +79,18 @@ export class TelegramExporter implements Exporter {
     const url = `${API_BASE}/bot${botToken}/sendMessage`;
     const text = `${title}\n${formatNotification(data, context)}`;
 
-    return withRetry(
-      async () => {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text,
-            disable_notification: silent,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-
-        if (!response.ok) {
-          throw httpError(response.status);
-        }
-
-        log.info('Telegram notification sent.');
-        return { success: true };
+    return sendWithRetry(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, disable_notification: silent }),
       },
-      { log, label: 'telegram notification' },
+      {
+        log,
+        label: 'telegram notification',
+        onOk: () => log.info('Telegram notification sent.'),
+      },
     );
   }
 }

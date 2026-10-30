@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DigooScaleAdapter } from '../../src/scales/digoo.js';
-import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   defaultProfile,
+  makeConnectionContext,
   expectMatches,
   parseOk,
   expectValidMetrics,
 } from '../helpers/scale-test-utils.js';
+import { WEIGHT_ONLY_HOLD_MS } from '../../src/scales/body-comp-helpers.js';
 
 /** Full Digoo frame: weight + control byte (bit0 stable, bit1 allValues) + body comp. */
 function frame(control: number, weight = 8000): Buffer {
@@ -53,22 +54,37 @@ describe('DigooScaleAdapter', () => {
   });
 
   describe('isComplete()', () => {
-    it('returns true when weight > 0 and stable and allValues', () => {
-      adapter.parseNotification(frame(0x03)); // stable + allValues
-      expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(true);
+    it('returns true and final when weight > 0 and stable and allValues', () => {
+      const reading = adapter.parseNotification(frame(0x03))!; // stable + allValues
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(true);
     });
 
-    it('returns false when not stable', () => {
-      adapter.parseNotification(frame(0x02)); // allValues but not stable
-      expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(false);
+    it('treats an allValues frame without the stable bit as the final reading', () => {
+      // openScale's DigooDGSO38HHandler returns early on a stable frame (it
+      // answers with its profile request there) and publishes only from an
+      // allValues frame that reaches the next branch, i.e. one without the
+      // stable bit. Requiring both bits could therefore never complete.
+      const reading = adapter.parseNotification(frame(0x02))!; // allValues, not stable
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(true);
     });
 
-    it('returns false when not allValues', () => {
+    it('completes a stable weight without composition after a short hold (D-07, D028)', () => {
+      // A weigh-in the scale could not analyse used to be refused for good, so
+      // the session ran into its timeout and the weight was lost.
       const buf = Buffer.alloc(19);
       buf.writeUInt16BE(8000, 3);
       buf[5] = 0x01; // stable but no allValues
-      adapter.parseNotification(buf);
-      expect(adapter.isComplete({ weight: 80, impedance: 0 })).toBe(false);
+      const reading = adapter.parseNotification(buf)!;
+      expect(adapter.isComplete(reading)).toBe(true);
+      expect(adapter.isFinal(reading)).toBe(false);
+      expect(adapter.completionHoldMs).toBe(WEIGHT_ONLY_HOLD_MS);
+    });
+
+    it('returns false for a settling weight (neither stable nor allValues)', () => {
+      const reading = adapter.parseNotification(frame(0x00))!;
+      expect(adapter.isComplete(reading)).toBe(false);
     });
 
     it('returns false when weight is 0', () => {
@@ -81,12 +97,12 @@ describe('DigooScaleAdapter', () => {
       const writeFn = vi.fn().mockResolvedValue(undefined);
       const profile = defaultProfile({ gender: 'male', height: 183, age: 30 });
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile,
-      };
+      });
 
       await adapter.onConnected!(ctx);
 
@@ -108,12 +124,12 @@ describe('DigooScaleAdapter', () => {
       const writeFn = vi.fn().mockResolvedValue(undefined);
       const profile = defaultProfile({ gender: 'female', height: 165, age: 25 });
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile,
-      };
+      });
 
       await adapter.onConnected!(ctx);
 
@@ -134,5 +150,37 @@ describe('DigooScaleAdapter', () => {
       const payload = adapter.computeMetrics({ weight: 0, impedance: 0 }, defaultProfile());
       expect(payload.weight).toBe(0);
     });
+  });
+});
+
+// #394: adapters are shared singletons and computeMetrics() runs LATER than the
+// parse that produced the reading. On the mqtt-proxy and esphome-proxy watchers
+// the loop awaits processReading() - network exports included - while the
+// watcher is free to open the NEXT session, so onSessionStart() for session N+1
+// can land BEFORE computeMetrics() for session N. Reading the live cache there
+// hands the completed reading somebody else's composition.
+//
+// Each test below interleaves the two in exactly that order. Asserting only on
+// the payload of an uninterrupted session would pass with or without the fix.
+
+describe('DigooScaleAdapter session boundary (#394)', () => {
+  it('keeps the completed reading composition when the NEXT session starts first', () => {
+    const a = new DigooScaleAdapter();
+    const reading = a.parseNotification(frame(0x03))!;
+    expect(a.isComplete(reading)).toBe(true);
+    a.onSessionStart();
+    const payload = a.computeMetrics(reading, defaultProfile());
+    expect(payload.bodyFatPercent).toBeCloseTo(22.5, 1);
+  });
+
+  it('does not hand a hand-built reading the previous session composition', () => {
+    const a = new DigooScaleAdapter();
+    a.parseNotification(frame(0x03));
+    a.onSessionStart();
+    // No frame this session, so the live cache is all computeMetrics can fall
+    // back on. stable/allValues are deliberately NOT asserted here: parse
+    // rewrites both on every frame, so a test on those would pass either way.
+    const payload = a.computeMetrics({ weight: 80, impedance: 0 }, defaultProfile());
+    expect(payload.bodyFatPercent).not.toBeCloseTo(22.5, 1);
   });
 });

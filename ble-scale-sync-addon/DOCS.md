@@ -1,150 +1,80 @@
 # BLE Scale Sync
 
-Read body composition data from BLE smart scales and export to Home Assistant (MQTT auto-discovery), Garmin Connect, and more.
+Reads BLE smart scales and sends each weigh-in to Home Assistant over MQTT auto-discovery, to Garmin Connect and to [other exporters](https://blescalesync.dev/exporters). The full guide is at [blescalesync.dev/guide/home-assistant-addon](https://blescalesync.dev/guide/home-assistant-addon).
 
-## Quick Start
+## Getting started
 
-1. Install the add-on
-2. In the **Configuration** tab, set your **Scale MAC address** (or leave empty for auto-discovery)
-3. Fill in your **user profile** (height, birth date, gender)
-4. **MQTT** is enabled by default with auto-detection from the Mosquitto add-on
-5. Start the add-on
+1. If you have no MQTT broker yet, install and start the **Mosquitto broker** app.
+2. On the **Configuration** tab, fill in the user profile (name, height, birth date, gender), and leave **Enable MQTT** and **Auto-detect MQTT broker** on.
+3. Leave **Scale MAC address** empty for the first weigh-in.
+4. If this host's Bluetooth adapter is out of range of the scale, or the host has none, pick another **Bluetooth transport** (below).
+5. Start the app on the **Info** tab and step on the scale.
+6. Copy the scale's address from the `Auto-discovered:` or `Matched:` line of the log into **Scale MAC address** and restart the app, so it never reads a neighbor's scale.
 
-Your scale measurements will appear as Home Assistant sensors automatically.
+The sensors appear under **Settings** > **Devices & services** > **MQTT** after the first reading. Masses always reach Home Assistant in kg; to see pounds, change the unit in the sensor's settings.
 
-## Finding Your Scale MAC
+With the `ha-bluetooth` transport, **Settings** > **Devices & services** > **Bluetooth** > **Advertisement monitor** also shows the scale's address while you stand on it. Check the [supported scales](https://blescalesync.dev/guide/supported-scales) for your model.
 
-1. Start the add-on with debug logging enabled
-2. Step on your scale to wake it up
-3. Check the add-on logs for discovered devices
-4. Copy the MAC address and paste it into the Scale MAC field
+## Bluetooth transports
 
-## MQTT Auto-Detection
+| Your setup                                                                                                          | Transport         |
+| ------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| This host's Bluetooth adapter is in range of the scale                                                              | `local` (default) |
+| The scale sends its weight in its advertisement, and Home Assistant already hears it (any adapter or proxy it uses) | `ha-bluetooth`    |
+| The scale needs a connection, and an ESPHome Bluetooth proxy that Home Assistant has not adopted is near it         | `esphome-proxy`   |
+| The scale needs a connection, and an ESP32 with the BLE Scale Sync proxy firmware is near it                        | `mqtt-proxy`      |
 
-When **Auto-detect MQTT broker** is enabled, the add-on automatically discovers the Mosquitto add-on broker. No manual MQTT configuration needed.
+[Which scales work](https://blescalesync.dev/guide/ha-bluetooth#which-scales-work) lists the scales that send their weight in the advertisement; every other scale needs a connection. Setting up the node: [ESPHome proxy](https://blescalesync.dev/guide/esphome-proxy), [ESP32 proxy](https://blescalesync.dev/guide/esp32-proxy).
 
-If you use an external MQTT broker, disable auto-detect and enter the broker URL, username, and password manually.
+- `ha-bluetooth` needs no other option and no access token. An ESPHome node used this way is adopted in Home Assistant.
+- `esphome-proxy` needs **ESPHome proxy host** and, for a device with API encryption, **ESPHome API encryption key**. The node must not be adopted in Home Assistant.
+- `mqtt-proxy` uses the broker of the MQTT options (`shared`) or one inside this app (`embedded`, with its own port, username and password). Give the ESP32 the same broker address, device ID and topic prefix in its `config.json`.
 
-## Units
-
-**Weight unit** and **Height unit** let you choose metric (kg/cm) or imperial (lbs/in). The selection is applied to the scale readings, the user profile height, and the weight range used for user matching. Defaults are kg and cm.
-
-Changing units after the first reading does not reinterpret existing data. Switch units first, then record a measurement.
-
-## Persistent last known weight
-
-The add-on stores its runtime configuration at `/data/config.yaml` and preserves each user's `last_known_weight` across add-on restarts. This is important for multi-user matching: after the first reading the remembered weight is reused to pick the right user on subsequent scans, even after you restart Home Assistant or the add-on.
-
-If you change the user slug (by renaming the user), the remembered weight does not carry over because the slug is the lookup key.
-
-## Home Assistant Sensors
-
-With MQTT and HA auto-discovery enabled, these sensors appear automatically:
-
-- Weight
-- Body fat (%)
-- Water (%)
-- Muscle mass
-- Bone mass
-- BMI
-- BMR (kcal)
-- Visceral fat
-- Metabolic age
-- Impedance (diagnostic)
-
-Weight, muscle mass, and bone mass use the weight unit you selected (kg or lbs).
+With any transport but `local`, the options that steer this host's adapter and the scan delays are not used, and the adapter reset at startup is skipped.
 
 ## Garmin Connect
 
-To upload measurements to Garmin Connect:
-
-1. Enable **Garmin Connect** in the configuration
-2. Enter your Garmin email and password
-3. Start the add-on
-
-On first start the add-on authenticates with Garmin and stores the OAuth tokens under `/data/garmin-tokens` inside the container. Subsequent runs reuse those tokens, so your password is only used once.
+Turn on **Enable Garmin Connect**, enter your Garmin email and password and start the app. It signs in once and keeps the token in `/data/garmin-tokens`.
 
 ### If your Garmin account uses MFA
 
-Home Assistant add-ons run without an interactive terminal, so the add-on cannot prompt for a 2FA code. If your account has MFA enabled:
+This app has no terminal to type an MFA code into. The same steps work when Garmin blocks this host's IP address:
 
-1. On a laptop or desktop, clone the repo and run:
-   ```bash
-   python3 garmin-scripts/setup_garmin.py
-   ```
-   Enter your email, password, and MFA code when prompted. This writes `garmin_tokens.json` to `~/.garmin_tokens/`.
-2. Copy that file into `/share/ble-scale-sync/garmin-tokens/` on the Home Assistant host (use the Samba or File editor add-on).
-3. Restart the BLE Scale Sync add-on. On startup it detects the pre-generated token and imports it into `/data/garmin-tokens/`.
+1. On another computer, run `setup-garmin` from BLE Scale Sync as described under [Garmin authentication](https://blescalesync.dev/exporters#garmin-authentication), and enter the MFA code when asked.
+2. Copy the `garmin_tokens.json` it wrote into `/share/ble-scale-sync/garmin-tokens/` on this host, with the Samba share or File editor app.
+3. Restart the app. The log shows `IMPORTING a Garmin token`.
 
-If Garmin also blocks cloud or residential proxy IPs, the same workflow applies: authenticate from a trusted network, then import the token.
+The token is imported only while `/data/garmin-tokens` holds none. To switch to another account, reinstall the app (this also clears the remembered weights and the retry queue) and import again.
 
-If you disable Garmin in the add-on UI, cached tokens are left in place so you can turn it back on without re-authenticating.
+## Custom config
 
-### Upgrading from add-on v1.7.x or v1.8.0
+For several users, other exporters or transport settings the tab does not have, turn on **Use custom config.yaml** and put your file at `/share/ble-scale-sync/config.yaml`. The other options are then ignored, except **Proxy silence before restart**, and **Bluetooth adapter** with **Reset Bluetooth adapter on startup**, which still control the adapter reset at startup. Restart the app after editing the file. Details: [custom config mode](https://blescalesync.dev/guide/home-assistant-addon#custom-config-mode).
 
-Add-on v1.8.1 bumps `garminconnect` to 0.3.x, which uses a new native auth engine and a new token format. Tokens from earlier versions (`oauth1_token.json`, `oauth2_token.json`) are incompatible and are removed automatically on first start. The add-on re-runs `setup_garmin.py` with the email and password you entered in the UI, so for non-MFA accounts no action is needed beyond restarting the add-on. MFA users follow the workaround above with the new single-file token.
+## BLE Scale Sync restarts on its own
 
-## Advanced: Custom Config
+When BLE Scale Sync cannot recover inside the running process, for example after repeated Bluetooth failures or when a Bluetooth proxy stays silent, it exits and the app starts it again, without the Supervisor's Watchdog switch. The log shows `BLE Scale Sync exited with code N after Ns; restart #M in Ns.` The wait starts at 5 seconds and doubles while BLE Scale Sync keeps exiting shortly after starting, up to 5 minutes; a run of 10 minutes resets it. The reason is in the lines above each restart.
 
-The Configuration tab covers the scale, the primary user profile, MQTT and Garmin Connect. Every other exporter (InfluxDB, Webhook, Ntfy, Telegram, Intervals.icu, Strava, Runalyze, Wger, File), every multi-user setup and the alternative BLE transports are configured through a custom `config.yaml`. See the [exporters reference](https://blescalesync.dev/exporters) for each one's options.
+## Errors at startup
 
-To use one, enable **Use custom config.yaml** and place your configuration at:
+A transport that cannot run stops the app with `ERROR:` and the reason, followed by `Not falling back to the built-in Bluetooth adapter`. Fix the option it names, or set **Bluetooth transport** back to `local`:
 
-```
-/share/ble-scale-sync/config.yaml
-```
+- `esphome_proxy_host is empty`, or `takes a host name or IP address, not a URL`: enter only the address, such as `192.168.1.50`.
+- `esphome_proxy_encryption_key is not a valid ESPHome API key`: copy the whole key from `api: encryption: key:` in the device's YAML, 44 characters ending in `=`.
+- `no MQTT broker is available`: start the Mosquitto broker app with **Auto-detect MQTT broker** on, set **MQTT broker URL**, or set **ESP32 proxy broker** to `embedded`.
+- `needs an mqtt_broker_url that starts with mqtt:// or mqtts://`: the ESP32 proxy cannot share a `ws://` broker; enter the `mqtt://` address or use `embedded`.
+- `needs mqtt_proxy_username and mqtt_proxy_password`: fill in both.
+- `cannot contain + or #`: use the same plain device ID and topic prefix as the ESP32's `config.json`.
+- `the Supervisor gave this add-on no SUPERVISOR_TOKEN`: open an issue with the log.
 
-See [config.yaml.example](https://github.com/KristianP26/ble-scale-sync/blob/main/config.yaml.example) for the full reference.
+Other startup errors:
 
-When custom config is enabled, all other options in the Configuration tab are ignored.
+- `custom_config is enabled but /share/ble-scale-sync/config.yaml does not exist`: create the file or turn off **Use custom config.yaml**.
+- `DBusError` with `AccessDenied` and `An AppArmor policy prevents this sender`: uninstall and reinstall the app so the Supervisor applies its manifest.
 
-### Alternative BLE transports (no host Bluetooth needed)
+## More help
 
-If your Home Assistant host has no Bluetooth adapter, or its built-in radio gets stuck under continuous-mode load, custom config mode unlocks two BLE-free transport options shipped in 1.10.0:
-
-- **[ESP32 BLE Proxy](https://blescalesync.dev/guide/esp32-proxy)** (`ble.handler: mqtt-proxy`) — relay BLE over MQTT from a ~8€ ESP32 board placed near your scale. Includes an embedded MQTT broker so you do not need to install Mosquitto.
-- **[ESPHome Bluetooth proxy](https://blescalesync.dev/guide/esphome-proxy)** (`ble.handler: esphome-proxy`, experimental, broadcast-only) — reuse an existing ESPHome BT proxy mesh you already run for Home Assistant.
-
-Both transports work without `host_dbus` or any host Bluetooth at all.
-
-## Supported Scales
-
-25+ BLE smart scale brands are supported, including Xiaomi (Mi Scale 2), Renpho (Elis 1, FITINDEX, Sencor, QN-Scale), Eufy (incl. P2 / P2 Pro), Yunmai, Beurer, Sanitas, Medisana, Trisa / ADE, and more.
-
-See the [full list](https://blescalesync.dev/guide/supported-scales).
-
-## Troubleshooting
-
-### Add-on exits immediately with `DBusError: ... AccessDenied`
-
-The full error mentions `An AppArmor policy prevents this sender from sending this message`, names `member="Hello"`, and appears before any scanning starts.
-
-The Supervisor's default AppArmor profile does not allow the D-Bus calls this add-on makes to reach BlueZ. Newer add-on versions run unconfined instead, so updating to the latest version fixes it. If you still see this after updating, uninstall and reinstall the add-on so the Supervisor picks up the new manifest.
-
-### Bluetooth adapter reset
-
-The add-on power-cycles the Bluetooth adapter on startup to ensure a clean state. This is enabled by default (**Reset Bluetooth adapter on startup**). If you have other HA Bluetooth integrations that lose connectivity when this add-on restarts, disable the option.
-
-### No scale found
-
-- Make sure your scale is awake (step on it)
-- Check that the Bluetooth adapter is working: enable debug logging and look for "Discovery started" in the logs
-- If you have multiple Bluetooth adapters, try setting a specific adapter (e.g., `hci1`)
-
-### MQTT not connecting
-
-- Check that the Mosquitto add-on is running
-- If using an external broker, verify the URL and credentials
-- Enable debug logging for detailed MQTT connection info
-
-### Garmin upload failing
-
-- Check that your email and password are correct
-- Garmin may require re-authentication after a while; check the logs for auth errors
-
-## Links
-
-- [Documentation](https://blescalesync.dev)
-- [GitHub](https://github.com/KristianP26/ble-scale-sync)
+- [Home Assistant add-on guide](https://blescalesync.dev/guide/home-assistant-addon)
 - [Supported scales](https://blescalesync.dev/guide/supported-scales)
-- [Issue tracker](https://github.com/KristianP26/ble-scale-sync/issues)
+- [Exporters](https://blescalesync.dev/exporters)
+- [Troubleshooting](https://blescalesync.dev/troubleshooting)
+- [Issue tracker](https://github.com/KristianP26/ble-scale-sync/issues): attach the app log with **Debug logging** on, the scale model and the transport.

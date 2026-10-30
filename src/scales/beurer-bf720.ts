@@ -10,7 +10,8 @@ import type {
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
 import { uuid16, buildPayload, type ScaleBodyComp } from './body-comp-helpers.js';
-import { bleLog } from '../ble/types.js';
+import { bleLog, LBS_TO_KG, normalizeUuid } from '../ble/types.js';
+import { parseSigDateTime, parseSigWeightMeasurement, trustedScaleTime } from './sig-wss.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 
 // ─── Beurer SIG-standard adapter (BF720, BF105) ─────────────────────────────
@@ -124,13 +125,15 @@ const BEURER_COMPANY_ID = 0x0611;
 /**
  * SIG User Data Service "Register New User": `01 <consent code u16 LE>`.
  *
- * A SIG user record exists ONLY after this operation. The profiles created in
- * the scale's own SET menu are display-side records for its body-composition
- * maths and are NOT SIG users, so on a scale whose user was registered by the
- * vendor app, Consent can never succeed from another client whatever code is
- * supplied: there is no record that client is entitled to. Established on a
- * BF915 in #335, where all three slots answered USER_NOT_AUTHORIZED with every
- * code tried, on a link that bonded and subscribed cleanly.
+ * A SIG user record exists ONLY after this operation or, on a BF915, after the
+ * profile is created in the scale's own SET menu: there the menu profiles ARE
+ * the SIG slots, and the four-digit consent code is the one the scale displays
+ * (#335, measured after a factory reset: a menu-created U:1 left Register New
+ * User returning index 2, and Consent on index 1 returned the menu values). A
+ * scale whose user was registered by the vendor app can still refuse every
+ * consent from another client: the first BF915 in #335 answered
+ * USER_NOT_AUTHORIZED on all three slots with every code tried. Whether the
+ * menu profiles are SIG slots on the BF7xx models is not established.
  *
  * The scale answers with the index it assigned, which is what the user then
  * puts in `users[].beurer_user_index`.
@@ -150,23 +153,47 @@ const UCP_RESULTS: Record<number, string> = {
   0x05: 'USER_NOT_AUTHORIZED',
 };
 
-/**
- * Frames whose embedded timestamp is older than this are treated as cached
- * historical readings (routed into the back-dated replay path). BF720 stamps
- * every frame including the live weigh-in, so the age check is what separates
- * a live measurement (stamped "now") from the on-scale history dump (stamped
- * days ago).
- */
-const HISTORY_MAX_AGE_MS = 5 * 60_000;
-
-/** SIG mass fields are in lb when the frame's unit flag is set. */
-const LBS_TO_KG = 0.453592;
-
 interface CachedComp {
   fat?: number; // %
   muscle?: number; // %
   waterMass?: number; // kg
   softLean?: number; // kg
+  impedance?: number; // ohm
+}
+
+/**
+ * One weigh-in's state, replaced whole in onSessionStart (#394, SCALES.md).
+ * `session`, `ctx` and the three `scaleAuth`-derived fields stay on the adapter
+ * and are set in `onConnected`: they are values to capture from a context that
+ * does not exist yet when the session starts.
+ */
+class Bf720Session {
+  cachedWeight = 0;
+  cachedTimestamp: Date | undefined;
+  /** User slot the current weigh-in's frames name, when they carry one. */
+  cachedUserIndex: number | undefined;
+  cachedComp: CachedComp = {};
+  profileSyncDone = false;
+  /** Vendor user-slot records seen on 0xFFF2 this session. */
+  userSlotsSeen = 0;
+  /** Whether the vendor user list terminated (or reported an error) this session. */
+  userListAnswered = false;
+  /** Latch so the "no stored users" hint is printed at most once per session. */
+  emptyListReported = false;
+  /** Whether the scale accepted the consent code this session. */
+  consentAccepted = false;
+  /**
+   * Whether the scale answered the consent write at all this session, with any
+   * result. Distinct from {@link consentAccepted}: a rejection is answered and
+   * already warns, whereas silence produces no diagnostic of its own and is the
+   * failure mode behind #83, #290 and #335. The session then ends as a bare
+   * "disconnected before reading completed", which says nothing about consent.
+   */
+  consentAnswered = false;
+  /** Whether a consent write went out this session (gates the silence warning). */
+  consentSent = false;
+  /** Whether a reading was emitted this session (gates the session-end warning). */
+  readingEmitted = false;
 }
 
 /**
@@ -190,14 +217,13 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
   readonly match: MatchDescriptor = {
     priority: 220,
     custom: true,
-    names: { includes: ['bf720', 'bf105', 'bf500', 'bf788', 'bf950'] },
+    names: { includes: ['bf720', 'bf105', 'bf500', 'bf788', 'bf950', 'bf915'] },
     serviceUuids: ['181d', '181b'],
     manufacturerId: 0x0611,
   };
   // Legacy single-char fallback (unused in multi-char mode).
   readonly charNotifyUuid = CHR_WEIGHT_MEASUREMENT;
   readonly charWriteUuid = CHR_CURRENT_TIME;
-  readonly normalizesWeight = true;
   // SIG User Data Service (0x181C) CCCD writes need an encrypted link; the
   // node-ble handler attempts a best-effort bond before subscribing. #168
   readonly requiresBonding = true;
@@ -213,9 +239,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     { uuid: CHR_CURRENT_TIME, type: 'write' },
   ];
 
-  private cachedWeight = 0;
-  private cachedTimestamp: Date | undefined;
-  private cachedComp: CachedComp = {};
+  private s = new Bf720Session();
   /**
    * The adapter instance is shared across GATT sessions, so the post-consent
    * profile sync is keyed on a session counter: a late consent response must
@@ -223,44 +247,18 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
    */
   private ctx: ConnectionContext | undefined;
   private session = 0;
-  private profileSyncDone = false;
   /** Scale user slot the consent applies to; used in the log lines. */
   private userIndex = 1;
   /** users[].beurer_register_new_user: create a SIG user record (#335). */
   private registerNewUser = false;
   /** users[].beurer_provision: write the profile into an empty scale (#229). */
   private provision = false;
-  /** Vendor user-slot records seen on 0xFFF2 this session. */
-  private userSlotsSeen = 0;
-  /** Whether the vendor user list terminated (or reported an error) this session. */
-  private userListAnswered = false;
-  /** Latch so the "no stored users" hint is printed at most once per session. */
-  private emptyListReported = false;
-  /** Whether the scale accepted the consent code this session. */
-  private consentAccepted = false;
-  /**
-   * Whether the scale answered the consent write at all this session, with any
-   * result. Distinct from {@link consentAccepted}: a rejection is answered and
-   * already warns, whereas silence produces no diagnostic of its own and is the
-   * failure mode behind #83, #290 and #335. The session then ends as a bare
-   * "disconnected before reading completed", which says nothing about consent.
-   */
-  private consentAnswered = false;
-  /** Whether a consent write went out this session (gates the silence warning). */
-  private consentSent = false;
-  /** Whether a reading was emitted this session (gates the session-end warning). */
-  private readingEmitted = false;
   /**
    * Field labels already warned about, for the process lifetime. In continuous
    * mode a scale with a legitimately empty field would otherwise print the same
    * four lines on every cycle, forever.
    */
   private readonly warnedFields = new Set<string>();
-  /**
-   * Composition as it stood when each reading was emitted. Weak so buffered
-   * history readings do not pin memory once the processor drops them.
-   */
-  private readonly compByReading = new WeakMap<ScaleReading, CachedComp>();
 
   matches(device: BleDeviceInfo): boolean {
     const name = (device.localName || '').toLowerCase();
@@ -287,12 +285,19 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // absent, so the name is what routes them here. Reading still needs the
     // per-device beurer_pin and a bonded link, so the ESPHome proxy path
     // (unbonded) is expected to need the native handler instead.
+    //
+    // BF915 is the same family by every account this project has of it: bond,
+    // per-device consent code, SIG user slots, the measurement on 2a9d (#335,
+    // #417, PROTOCOLS.md). Its name used to route it to Sanitas SBF72/73, which
+    // has none of that (no bond, consent code 0 on slot 1, 2a9c only), so a
+    // BF915 read only with `ble.force_scale_adapter` (review C-07).
     if (
       name.includes('bf720') ||
       name.includes('bf105') ||
       name.includes('bf500') ||
       name.includes('bf788') ||
-      name.includes('bf950')
+      name.includes('bf950') ||
+      name.includes('bf915')
     ) {
       return true;
     }
@@ -326,6 +331,30 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     );
   }
 
+  /**
+   * The Weight Scale (0x181D) service data in the advertisement: `01` while a
+   * weigh-in waits on the scale for its collector, an empty payload while none
+   * does (#418, a BF915: 11 of 12 observations, `01` held for 17 minutes until
+   * the weigh-in was fetched, also while the scale held no bond for the host).
+   * Anything else, `00` included, never occurred and says nothing.
+   *
+   * Read only to try a held-back pairing at once when somebody weighs in
+   * (#471, D063). One unit is the whole evidence, so nothing else depends on it.
+   */
+  advertisesPendingReading(device: BleDeviceInfo): boolean | undefined {
+    const entry = (device.serviceData ?? []).find(
+      (sd) => normalizeUuid(sd.uuid) === SVC_WEIGHT_SCALE,
+    );
+    if (!entry) return undefined;
+    if (entry.data.length === 0) return false;
+    if (entry.data.length === 1 && entry.data[0] === 0x01) return true;
+    return undefined;
+  }
+
+  onSessionStart(): void {
+    this.s = new Bf720Session();
+  }
+
   async onConnected(ctx: ConnectionContext): Promise<void> {
     const required = [CHR_WEIGHT_MEASUREMENT, CHR_BODY_COMPOSITION, CHR_USER_CONTROL_POINT];
     const missing = required.filter((u) => !ctx.availableChars.has(u));
@@ -347,23 +376,11 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     }
     const userIndex = ctx.scaleAuth?.userIndex ?? 1;
 
-    // Reset per-connection state (adapter instance is shared across sessions).
-    this.cachedWeight = 0;
-    this.cachedTimestamp = undefined;
-    this.cachedComp = {};
     this.session += 1;
     this.ctx = ctx;
-    this.profileSyncDone = false;
     this.userIndex = userIndex;
     this.registerNewUser = ctx.scaleAuth?.registerNewUser === true;
     this.provision = ctx.scaleAuth?.provision === true;
-    this.userSlotsSeen = 0;
-    this.userListAnswered = false;
-    this.emptyListReported = false;
-    this.consentAccepted = false;
-    this.consentAnswered = false;
-    this.consentSent = false;
-    this.readingEmitted = false;
 
     await ctx.write(CHR_CURRENT_TIME, this.buildCurrentTime(), true);
 
@@ -390,7 +407,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
         [UCP_REGISTER_NEW_USER, pin & 0xff, (pin >> 8) & 0xff],
         true,
       );
-      this.consentSent = true;
+      this.s.consentSent = true;
       bleLog.info(
         `Beurer BF720: registering a new user with consent code ${pin}. ` +
           'This creates a record on the scale.',
@@ -403,7 +420,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       [UCP_CONSENT, userIndex & 0xff, pin & 0xff, (pin >> 8) & 0xff],
       true,
     );
-    this.consentSent = true;
+    this.s.consentSent = true;
     bleLog.debug(`Beurer BF720: consent sent for user index ${userIndex}`);
   }
 
@@ -420,8 +437,8 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
    */
   private async syncUserProfile(session: number): Promise<void> {
     const ctx = this.ctx;
-    if (!ctx || session !== this.session || this.profileSyncDone) return;
-    this.profileSyncDone = true;
+    if (!ctx || session !== this.session || this.s.profileSyncDone) return;
+    this.s.profileSyncDone = true;
     try {
       // Every read and write is isolated: only the BF788 is proven from a
       // capture, and on a sibling model one locked-down or read-only
@@ -487,9 +504,19 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
           bleLog.debug(`Beurer BF720: change increment rejected: ${String(err)}`);
         }
       }
+      // "0 from config" reads like a failure to anyone who set
+      // beurer_provision expecting their values to land, so say why it is zero.
+      // Config is only ever written into a field the scale reports as unset;
+      // there is no overwrite, and a factory reset is the only way to change a
+      // record the scale already holds (#335).
+      const provisionedNote =
+        provisioned === 0 && this.provision
+          ? '0 from config (every field was already populated on the scale; ' +
+            'a factory reset is the only way to change them)'
+          : `${provisioned} from config`;
       bleLog.debug(
         `Beurer BF720: user profile committed (${written}/${values.size} characteristics ` +
-          `written, ${provisioned} from config, change increment ${increment}); ` +
+          `written, ${provisionedNote}, change increment ${increment}); ` +
           'scale can complete the measurement',
       );
     } catch (err) {
@@ -504,7 +531,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (data.length === 0) return;
     if (data[0] === 0x01) {
       bleLog.debug('Beurer BF720: end of user-slot list');
-      this.userListAnswered = true;
+      this.s.userListAnswered = true;
       this.reportEmptyUserList();
       return;
     }
@@ -512,7 +539,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       // A truncated record still proves a slot exists; only its layout is
       // unknown. Counting it is what stops the "no stored users" hint firing on
       // a scale that plainly has one.
-      this.userSlotsSeen += 1;
+      this.s.userSlotsSeen += 1;
       if (data.length < 12) {
         bleLog.debug(`Beurer BF720: short user-slot record (${data.length}B), not decoded`);
         return;
@@ -532,7 +559,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // slot. On its own that is weak evidence, which is why reportEmptyUserList
     // also requires the consent to have been refused before it says anything.
     bleLog.debug(`Beurer BF720: user-list status 0x${data[0].toString(16).padStart(2, '0')}`);
-    this.userListAnswered = true;
+    this.s.userListAnswered = true;
     this.reportEmptyUserList();
   }
 
@@ -554,7 +581,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
    * USER_NOT_AUTHORIZED warning sends people hunting for the right PIN.
    */
   private reportEmptyUserList(): void {
-    if (this.emptyListReported || !this.userListAnswered || this.userSlotsSeen > 0) return;
+    if (this.s.emptyListReported || !this.s.userListAnswered || this.s.userSlotsSeen > 0) return;
     // A scale that accepted the consent code is working. Telling that user to
     // switch to beurer_pin 0 would break a setup that reads fine today.
     //
@@ -563,15 +590,15 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // provisioning has written them, while the vendor user table stays empty.
     // A scale that accepts the consent, reports no slot and then never sends a
     // measurement is in exactly that state (#229).
-    if (this.consentAccepted) {
-      this.emptyListReported = true;
+    if (this.s.consentAccepted) {
+      this.s.emptyListReported = true;
       bleLog.debug(
         'Beurer BF720: the consent was accepted but the scale named no stored user slot, ' +
           'so its vendor user table is empty',
       );
       return;
     }
-    this.emptyListReported = true;
+    this.s.emptyListReported = true;
     bleLog.warn(
       'Beurer BF720: the scale reports no stored user profiles. Removing the batteries ' +
         'wipes every user slot and its consent code, so no code the scale was previously ' +
@@ -608,8 +635,9 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       return null;
     }
     if (charUuid === CHR_WEIGHT_MEASUREMENT) {
+      // A weight opens a weigh-in; only its 0x2A9C completes it (review C-01).
       this.parseWeightMeasurement(data);
-      return this.buildReading();
+      return null;
     }
     if (charUuid === CHR_BODY_COMPOSITION) {
       this.parseBodyComposition(data);
@@ -618,10 +646,13 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     return null;
   }
 
-  /** Legacy single-char path: only weight measurement frames. */
+  /**
+   * Legacy single-char path: only weight measurement frames, which never carry
+   * the composition this adapter emits on, so it caches and returns nothing.
+   */
   parseNotification(data: Buffer): ScaleReading | null {
     this.parseWeightMeasurement(data);
-    return this.buildReading();
+    return null;
   }
 
   private handleUcpResponse(data: Buffer): void {
@@ -629,7 +660,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // data[1] echoes the request opcode. Without this gate a response to some
     // other operation was read as a consent result.
     if (data[1] === UCP_REGISTER_NEW_USER) {
-      this.consentAnswered = true;
+      this.s.consentAnswered = true;
       const result = data[2];
       if (result !== UCP_RESULT_SUCCESS) {
         const why = UCP_RESULTS[result] ?? `0x${result.toString(16).padStart(2, '0')}`;
@@ -649,7 +680,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
           `Set 'users[].beurer_user_index: ${assigned ?? '<index>'}' and turn ` +
           "'beurer_register_new_user' back off, or the next run registers another one.",
       );
-      this.consentAccepted = true;
+      this.s.consentAccepted = true;
       void this.syncUserProfile(this.session);
       return;
     }
@@ -660,11 +691,11 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
       );
       return;
     }
-    this.consentAnswered = true;
+    this.s.consentAnswered = true;
     const result = data[2];
     const name = UCP_RESULTS[result] ?? `0x${result.toString(16).padStart(2, '0')}`;
     if (result === UCP_RESULT_SUCCESS) {
-      this.consentAccepted = true;
+      this.s.consentAccepted = true;
       bleLog.debug('Beurer BF720: consent accepted, awaiting measurement');
       void this.syncUserProfile(this.session);
     } else if (result === UCP_RESULT_NOT_AUTHORIZED) {
@@ -701,7 +732,12 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // check: a vendor-app trace of a BF950 addresses user index 2, while this
     // adapter defaults to 1, and a profile that was ever recreated or shared
     // with a second person is unlikely to sit first in the scale's own list.
-    if (this.consentSent && !this.consentAnswered) {
+    //
+    // Gated on the reading, not on the consent alone: a BF915 answers nothing
+    // at all on 2a9f and then delivers the measurement on 2a9d regardless, so
+    // the unqualified warning fired on a fully successful session and sent
+    // people off to try other slots for no reason (#335).
+    if (this.s.consentSent && !this.s.consentAnswered && !this.s.readingEmitted) {
       bleLog.warn(
         `Beurer BF720: the scale never answered the consent for user index ` +
           `${this.userIndex}. It rejects nothing and reports nothing in this state, so a ` +
@@ -713,68 +749,48 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // Only when nothing was emitted at all. cachedComp is reset by every zeroed
     // composition stub, so testing it alone would fire on a successful session
     // that happened to end with a stub.
-    if (!this.readingEmitted && this.cachedWeight > 0) {
+    if (!this.s.readingEmitted && this.s.cachedWeight > 0) {
       bleLog.warn(
-        `Beurer BF720: the session ended with a weight (${this.cachedWeight.toFixed(2)} kg) ` +
+        `Beurer BF720: the session ended with a weight (${this.s.cachedWeight.toFixed(2)} kg) ` +
           'but no usable body-composition values, so no reading was emitted. Either no ' +
           'composition frame arrived or every one of them was zeroed. Please report this ' +
           'log on issue #229.',
       );
     }
-    // Clearing the cache here, not only in onConnected, matters: multi-char
+    // Clearing the cache here as well as in onSessionStart matters: multi-char
     // subscriptions are enabled before onConnected is awaited, so a frame from
     // the next session could otherwise be parsed against this session's values
     // and inherit its composition snapshot and timestamp.
     this.ctx = undefined;
-    this.cachedWeight = 0;
-    this.cachedTimestamp = undefined;
-    this.cachedComp = {};
-  }
-
-  /** Decode a 7-byte SIG timestamp; return undefined on a zero/invalid date. */
-  private parseTimestamp(data: Buffer, offset: number): Date | undefined {
-    if (offset + 7 > data.length) return undefined;
-    const year = data.readUInt16LE(offset);
-    if (year === 0) return undefined;
-    const d = new Date(
-      year,
-      data[offset + 2] - 1,
-      data[offset + 3],
-      data[offset + 4],
-      data[offset + 5],
-      data[offset + 6],
-    );
-    return Number.isNaN(d.getTime()) ? undefined : d;
+    this.s.cachedWeight = 0;
+    this.s.cachedTimestamp = undefined;
+    this.s.cachedUserIndex = undefined;
+    this.s.cachedComp = {};
   }
 
   /**
-   * Only timestamps older than the freshness window mark a reading as
-   * historical. A live weigh-in is stamped "now" and must resolve immediately
-   * rather than being buffered as cached history.
+   * Weight Measurement 0x2A9D, decoded by the shared SIG decoder.
+   *
+   * The kg/lb rule lives in the decoder, because a reading is kilograms by
+   * contract (`ScaleReading.weight`). What stays here is
+   * the caching rule: a zero or non-finite weight must not overwrite a weight
+   * this session already has, because the scale sends zeroed frames of its own.
+   *
+   * A real weight starts a NEW weigh-in, so it clears what the previous one
+   * left behind: its composition, its time and its user slot (review C-01).
+   * Each was otherwise inherited by this weight until its own 0x2A9C arrived: a
+   * reading was emitted right here from the previous record's composition and
+   * pinned to this weight, and when it was a live weigh-in the session ended on
+   * it and exported somebody else's fat, water and impedance. A frame without a
+   * time also kept the previous record's time.
    */
-  private historicalTimestamp(ts: Date | undefined): Date | undefined {
-    if (!ts) return undefined;
-    return Date.now() - ts.getTime() > HISTORY_MAX_AGE_MS ? ts : undefined;
-  }
-
-  /** Weight Measurement 0x2A9D. */
   private parseWeightMeasurement(data: Buffer): void {
-    if (data.length < 3) return;
-    const flags = data[0];
-    const isKg = (flags & 0x01) === 0;
-    const hasTimestamp = (flags & 0x02) !== 0;
-
-    // `normalizesWeight = true` promises the shared layer that whatever comes
-    // out of here is already kg, so it skips its own conversion. An lb frame
-    // (flags bit 0) must therefore be converted here or pounds are exported as
-    // kilograms, a 2.2x error. The sibling standard-gatt adapter, which parses
-    // these identical SIG frames, has always done this.
-    const weight = data.readUInt16LE(1) * (isKg ? 0.005 : 0.01 * LBS_TO_KG);
-    if (weight > 0 && Number.isFinite(weight)) this.cachedWeight = weight;
-
-    if (hasTimestamp) {
-      const ts = this.parseTimestamp(data, 3);
-      if (ts) this.cachedTimestamp = ts;
+    const { weightKg, timestamp, userIndex } = parseSigWeightMeasurement(data);
+    if (weightKg !== undefined && weightKg > 0 && Number.isFinite(weightKg)) {
+      this.s.cachedWeight = weightKg;
+      this.s.cachedComp = {};
+      this.s.cachedTimestamp = trustedScaleTime(timestamp);
+      this.s.cachedUserIndex = userIndex;
     }
   }
 
@@ -813,33 +829,43 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // `leanBodyMass - softLean`, so a zeroed frame yields boneMass equal to the
     // entire body weight (verified: 117.92 kg of "bone" from this capture).
     //
-    // Reset rather than merely skip. `cachedComp` is cleared only in
-    // onConnected(), so leaving a previously decoded real value in place would
-    // stamp the live weigh-in's body fat onto every backdated history entry.
+    // Reset rather than merely skip. `cachedComp` is otherwise cleared only at
+    // the session boundaries (onSessionStart, onSessionEnd) and by the next
+    // real weight, so leaving a previously decoded real value in place would
+    // stamp it onto a weight that is paired with this stub.
     // 0xFFFF is the SIG sentinel for "measurement unsuccessful / unavailable".
     // buildPayload does not clamp a scale-provided fat, so letting it through
     // would export 6553.5 % and a negative bone mass. Not observed on these
     // models, unlike the zeroed stubs, but it is the same class of fabrication.
     if (fat === 0 || fat === 0xffff) {
-      this.cachedComp = {};
+      this.s.cachedComp = {};
       return;
     }
 
-    this.cachedComp.fat = fat * 0.1;
+    this.s.cachedComp.fat = fat * 0.1;
     off += 2;
 
     if (flags & 0x0002) {
       // Timestamp.
-      const ts = this.parseTimestamp(data, off);
-      if (ts) this.cachedTimestamp = ts;
+      const ts = trustedScaleTime(parseSigDateTime(data, off));
+      if (ts) this.s.cachedTimestamp = ts;
       off += 7;
     }
-    if (flags & 0x0004) off += 1; // User ID
+    if (flags & 0x0004) {
+      // User ID; 0xFF is the SIG "unknown user".
+      if (off < data.length && data[off] !== 0xff) this.s.cachedUserIndex = data[off];
+      off += 1;
+    }
     if (flags & 0x0008) off += 2; // Basal Metabolism (kJ, unused)
     if (flags & 0x0010) {
       const muscle = u16(off); // Muscle %
       if (muscle == null) return;
-      this.cachedComp.muscle = muscle * 0.1;
+      // Same rule the fat field above already applies: 0 and 0xFFFF are "no
+      // measurement", not a measurement of zero. buildPayload guards muscle on
+      // `!= null`, so a zero here exports 0 kg of muscle and a physique rating
+      // computed from it. Only the fat was guarded, which shielded the observed
+      // stubs (they zero both) but not a frame that zeroes only this one (#405).
+      if (muscle !== 0 && muscle !== 0xffff) this.s.cachedComp.muscle = muscle * 0.1;
       off += 2;
     }
     if (flags & 0x0020) off += 2; // Muscle Mass (unused)
@@ -847,21 +873,42 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     if (flags & 0x0080) {
       const softLean = u16(off); // Soft Lean Mass kg
       if (softLean == null) return;
-      this.cachedComp.softLean = softLean * massMul;
+      // Same rule again, and here it is the field with the worst failure mode:
+      // bone is derived as leanBodyMass - softLean, so a zeroed soft lean mass
+      // reports the entire lean mass as bone. That is the 117.92 kg of "bone"
+      // this file's own comment above records from the #229 capture (#405).
+      if (softLean !== 0 && softLean !== 0xffff) this.s.cachedComp.softLean = softLean * massMul;
       off += 2;
     }
     if (flags & 0x0100) {
       const waterMass = u16(off); // Body Water Mass kg
       if (waterMass == null) return;
-      this.cachedComp.waterMass = waterMass * massMul;
+      // buildPayload takes `comp.water ?? <estimate>`, so a zero here wins over
+      // the estimate and exports 0 % body water.
+      if (waterMass !== 0 && waterMass !== 0xffff)
+        this.s.cachedComp.waterMass = waterMass * massMul;
       off += 2;
     }
-    if (flags & 0x0200) off += 2; // Impedance (unused; native comp)
+    if (flags & 0x0200) {
+      // Impedance, 0.1 ohm per LSB. Skipped as "unused" since this adapter was
+      // written, on the reasoning that the scale supplies its own composition,
+      // so every reading from a BF720, BF788 or BF950 has carried a false zero
+      // (#354). It is not unused: the fields the scale does NOT supply are
+      // derived downstream, and a real impedance moves them off the BMI-only
+      // estimate onto the BIA equations.
+      const impedance = u16(off);
+      if (impedance == null) return;
+      // 0xFFFF is the SIG "unavailable" sentinel, not 6553.5 ohm, and the
+      // reading reports no impedance as 0 (D028, review C-11). `sig-bcs.ts`
+      // has always applied this; this walk did not.
+      if (impedance !== 0xffff) this.s.cachedComp.impedance = impedance * 0.1;
+      off += 2;
+    }
     if (flags & 0x0400) {
       const raw = u16(off); // Weight
       if (raw == null) return;
       const w = raw * massMul;
-      if (w > 0 && Number.isFinite(w)) this.cachedWeight = w;
+      if (w > 0 && Number.isFinite(w)) this.s.cachedWeight = w;
       off += 2;
     }
     // Remaining optional fields (Height, ...) are not needed.
@@ -870,20 +917,25 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
   /**
    * Emit a reading only once weight AND native body composition are both
    * known, mirroring openScale's weight/body-comp pairing. BF720 always sends
-   * both characteristics per measurement.
+   * both characteristics per measurement, the weight first.
+   *
+   * The frame's own time goes on every reading, live or stored (D027): the
+   * runtime, not this adapter, decides from its age whether it is a stored
+   * record. The user slot goes on when the frames name one.
    */
   private buildReading(): ScaleReading | null {
-    if (this.cachedWeight <= 0 || this.cachedComp.fat == null) return null;
-    const reading: ScaleReading = { weight: this.cachedWeight, impedance: 0 };
-    const histTs = this.historicalTimestamp(this.cachedTimestamp);
-    if (histTs) reading.timestamp = histTs;
-    // Snapshot the composition onto this specific reading. computeMetrics() runs
-    // much later (the processor calls it per buffered frame once the session has
-    // resolved), so reading the live cachedComp there would hand every history
-    // entry whatever happened to be cached at the END of the session. With a
-    // snapshot each reading keeps the composition it was actually built from.
-    this.compByReading.set(reading, { ...this.cachedComp });
-    this.readingEmitted = true;
+    if (this.s.cachedWeight <= 0 || this.s.cachedComp.fat == null) return null;
+    const reading: ScaleReading = {
+      weight: this.s.cachedWeight,
+      impedance: this.s.cachedComp.impedance ?? 0,
+      // A snapshot: computeMetrics() runs once the session has resolved, when the
+      // live cachedComp holds whatever came LAST, not what this reading was built
+      // from (#394).
+      scaleComposition: { ...this.s.cachedComp },
+    };
+    if (this.s.cachedTimestamp) reading.timestamp = this.s.cachedTimestamp;
+    if (this.s.cachedUserIndex !== undefined) reading.userIndex = this.s.cachedUserIndex;
+    this.s.readingEmitted = true;
     return reading;
   }
 
@@ -896,7 +948,7 @@ export class BeurerBf720Adapter implements ScaleAdapterCore, GattWiring, MultiCh
     // Per-reading snapshot taken in buildReading(). Falling back to the live
     // cache keeps direct callers (and tests) working for a reading this adapter
     // did not build.
-    const c = this.compByReading.get(reading) ?? this.cachedComp;
+    const c = (reading.scaleComposition as CachedComp | undefined) ?? this.s.cachedComp;
     const comp: ScaleBodyComp = {};
 
     if (c.fat != null) comp.fat = c.fat;

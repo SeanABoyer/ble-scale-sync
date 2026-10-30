@@ -4,6 +4,7 @@ import type { ConnectionContext } from '../../src/interfaces/scale-adapter.js';
 import {
   mockPeripheral,
   defaultProfile,
+  makeConnectionContext,
   assertPayloadRanges,
 } from '../helpers/scale-test-utils.js';
 
@@ -51,12 +52,12 @@ describe('MedisanaBs44xAdapter', () => {
       const adapter = makeAdapter();
       const writeFn = vi.fn().mockResolvedValue(undefined);
 
-      const ctx: ConnectionContext = {
+      const ctx = makeConnectionContext({
         write: writeFn,
         read: vi.fn(),
         subscribe: vi.fn(),
         profile: defaultProfile(),
-      };
+      });
 
       const before = Math.floor(Date.now() / 1000);
       await adapter.onConnected!(ctx);
@@ -74,6 +75,46 @@ describe('MedisanaBs44xAdapter', () => {
       expect(ts).toBeGreaterThanOrEqual(before);
       expect(ts).toBeLessThanOrEqual(after);
     });
+
+    // Epoch per model, as openScale's MedisanaBs44xHandler predicts it from
+    // the name: BS444/BS440 count from 2010-01-01, the BS430 and anything
+    // unknown count Unix seconds. Only the epoch choice is tested here; there
+    // is no Medisana capture in the repo to pin a frame against.
+    const NOW_SEC = 1_790_000_000;
+    async function syncedSeconds(deviceName: string | undefined): Promise<number> {
+      vi.useFakeTimers();
+      vi.setSystemTime(NOW_SEC * 1000);
+      try {
+        const writeFn = vi.fn().mockResolvedValue(undefined);
+        const ctx = {
+          write: writeFn,
+          read: vi.fn(),
+          subscribe: vi.fn(),
+          profile: defaultProfile(),
+          deviceAddress: '',
+          availableChars: new Set<string>(),
+          ...(deviceName !== undefined ? { deviceName } : {}),
+        } as ConnectionContext;
+        await makeAdapter().onConnected!(ctx);
+        return Buffer.from(writeFn.mock.calls[0][1]).readUInt32LE(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it.each(['013197A1B2', '013198', '0202B6FF'])(
+      'sends seconds since 2010-01-01 to a BS444/BS440 named "%s"',
+      async (name) => {
+        expect(await syncedSeconds(name)).toBe(NOW_SEC - 1262304000);
+      },
+    );
+
+    it.each([['0203B0123'], ['some other name'], [undefined]])(
+      'sends Unix seconds for name %s',
+      async (name) => {
+        expect(await syncedSeconds(name)).toBe(NOW_SEC);
+      },
+    );
   });
 
   describe('parseNotification()', () => {
@@ -182,5 +223,57 @@ describe('MedisanaBs44xAdapter', () => {
       const payload = adapter.computeMetrics({ weight: 0, impedance: 0 }, profile);
       expect(payload.weight).toBe(0);
     });
+  });
+});
+
+// #394: adapters are shared singletons. Before onSessionStart existed, a second
+// weigh-in could resolve on the FIRST frame using the previous person's data.
+//
+// Every one of these also asserts that computeMetrics still carries the scale's
+// own composition, because the first attempt at this fix cleared the caches in
+// onSessionEnd - which runs BEFORE computeMetrics - and would have deleted the
+// body composition from every reading while these tests stayed green.
+
+describe('MedisanaBs44xAdapter session boundary (#394)', () => {
+  function weightFrame(hundredths: number): Buffer {
+    const buf = Buffer.alloc(4);
+    buf.writeUInt16LE(hundredths, 1);
+    return buf;
+  }
+
+  function featureFrame(fatTenths: number): Buffer {
+    const buf = Buffer.alloc(16);
+    buf.writeUInt16LE(fatTenths, 8);
+    buf.writeUInt16LE(550, 10);
+    buf.writeUInt16LE(400, 12);
+    buf.writeUInt16LE(35, 14);
+    return buf;
+  }
+
+  it('keeps the completed reading composition when the NEXT session starts first', () => {
+    // The ordering this guards is real, not hypothetical: on the mqtt-proxy and
+    // esphome-proxy watchers the loop awaits processReading() - computeMetrics
+    // plus network exports - while the watcher is free to open the next GATT
+    // session. So onSessionStart() for session N+1 can land BEFORE
+    // computeMetrics() for session N. Without a per-reading snapshot this
+    // exports the Deurenberg BMI estimate instead of the scale's own figure.
+    const adapter = makeAdapter();
+    adapter.parseNotification(weightFrame(8000));
+    const reading = adapter.parseNotification(featureFrame(225))!;
+
+    adapter.onSessionStart();
+
+    const payload = adapter.computeMetrics(reading, defaultProfile());
+    expect(payload.bodyFatPercent).toBeCloseTo(22.5, 1);
+  });
+
+  it('does not export the previous weight when a feature frame arrives first', () => {
+    const adapter = makeAdapter();
+    adapter.parseNotification(weightFrame(8000));
+    adapter.parseNotification(featureFrame(225));
+
+    adapter.onSessionStart();
+
+    expect(adapter.parseNotification(featureFrame(310))).toBeNull();
   });
 });

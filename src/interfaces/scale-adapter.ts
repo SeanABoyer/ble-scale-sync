@@ -1,5 +1,5 @@
 import type { MatchDescriptor } from '../scales/match-descriptor.js';
-import type { WeightUnit } from '../config/schema.js';
+import type { ScaleDisplayUnit } from '../config/schema.js';
 export type { MatchDescriptor };
 
 export type Gender = 'male' | 'female';
@@ -7,6 +7,19 @@ export type Gender = 'male' | 'female';
 /** Minimal BLE advertisement info needed for adapter matching. */
 export interface BleDeviceInfo {
   localName: string;
+  /**
+   * The device's own BLE address, uppercase colon-separated, when the transport
+   * knows it. Every transport supplies it; it is optional only so that the many
+   * hand-written test fixtures stay valid.
+   *
+   * It exists for advertisements that identify themselves by echoing their own
+   * MAC inside the payload. Matching on such an echo is self-validating in a way
+   * a bare company id is not: a device that is not this scale will not
+   * accidentally contain the address it is advertising from. The Lefu family
+   * fingerprint uses the same trick, and #376 needed it for an ES-CS20M
+   * revision that advertises anonymously, with no name and no service UUIDs.
+   */
+  address?: string;
   serviceUuids: string[];
   /** Manufacturer-specific data from the BLE advertisement (if present). */
   manufacturerData?: { id: number; data: Buffer };
@@ -21,17 +34,91 @@ export interface BleDeviceInfo {
   characteristicUuids?: string[];
 }
 
-export interface ScaleReading {
+/**
+ * A weight the scale is DISPLAYING but has not committed to (#356).
+ *
+ * Broadcast scales stream their settling weights while somebody steps on. A
+ * Silvergear 108 capture that ends at 108.48 kg runs 39.60, 55.48, 83.46 and
+ * 107.03 on the way, so none of it is a measurement and publishing any of it
+ * would write a number the scale never showed.
+ *
+ * Deliberately NOT a `ScaleReading`, and deliberately missing the `impedance`
+ * that `ScaleReading` requires. Every exporter path takes a `ScaleReading` or a
+ * `RawReading`, so a value of this type cannot be handed to one: the type
+ * checker refuses it rather than a reviewer having to notice. That is the whole
+ * design. If this ever grows an `impedance`, the guarantee is gone.
+ */
+export interface LiveWeight {
+  /** Kilograms. Provisional: correct for a display, wrong for a record. */
   weight: number;
+}
+
+export interface ScaleReading<C = unknown> {
+  /** Kilograms, whatever unit the scale displays: the decoder converts. */
+  weight: number;
+  /**
+   * Raw impedance in ohms as the scale reported it, or 0 when the frame has
+   * none. Adapters report what they decoded and do NOT decide whether it is
+   * usable (ADR D028): the processor checks it against the plausible band
+   * (`IMPEDANCE_MIN_OHM`..`IMPEDANCE_MAX_OHM`) and sets it to 0 on this same
+   * object before `computeMetrics()` runs, so `computeMetrics()` sees either a
+   * plausible impedance or 0, and on 0 must fall back to the BMI estimate
+   * (`buildPayload` without a fat value) rather than run any impedance formula.
+   */
   impedance: number;
   /**
-   * When set, marks this reading as historical: the scale dumped it from its
-   * onboard cache rather than producing it live. Adapters populate it for
-   * offline frames whose protocol carries an age field (e.g. ES-26BB-B 0x15
-   * `secondsAgo`). Consumers route timestamped readings into the cache-replay
-   * pipeline; live readings leave it undefined.
+   * When the scale measured this reading (ADR D027).
+   *
+   * An adapter whose frame carries a time (the SIG Time Stamp flag, a vendor
+   * epoch, an age field such as ES-26BB-B 0x15 `secondsAgo`) MUST put it here,
+   * for live frames as well as stored ones; a frame without one leaves it
+   * undefined and is treated as measured on receipt. The runtime, not the
+   * adapter, decides what the time means: older than `HISTORY_WINDOW_MS`
+   * (`reading-time.ts`) is a stored record, which does not end the live
+   * session, goes only to exporters with `supportsBackdate`, and does not move
+   * `last_known_weight`. A fresher stamp is an ordinary live weigh-in.
+   *
+   * Only a clock the adapter can trust belongs here. A scale whose clock is
+   * unset (a year-2000 or epoch-zero default) would make every live weigh-in
+   * look like history; such a stamp must be dropped, not passed on.
    */
   timestamp?: Date;
+  /**
+   * The adapter knows from the protocol that this reading is a record from the
+   * scale's memory, not the weigh-in of this session (ADR D065). The runtime
+   * then treats it as a stored record whatever its age, where by `timestamp`
+   * alone a record younger than `HISTORY_WINDOW_MS` would count as live: it
+   * does not end the session, goes only to exporters with `supportsBackdate`
+   * and does not move `last_known_weight`.
+   *
+   * An adapter MUST NOT set it without a trusted `timestamp` in the past, and
+   * MUST NOT set it on a record of the weigh-in in progress. A reading flagged
+   * without a usable stamp still goes the history way, dated by its receipt,
+   * because the other way round (live) would end the session and reach MQTT
+   * with a weigh-in from the past; the replay dedup then judges it by weight
+   * alone. Leave it undefined when the protocol does not say; age decides then.
+   */
+  fromMemory?: boolean;
+  /**
+   * The scale's own user slot for this reading, when the frame says which
+   * profile on the scale it was taken for (a SIG User Index, a vendor user
+   * byte). Used to attribute a stored record in multi-user mode before falling
+   * back to weight matching (D027): it is matched against
+   * `users[].beurer_user_index`. Leave undefined when the frame does not carry
+   * one; never default it.
+   */
+  userIndex?: number;
+  /**
+   * What `computeMetrics()` needs from the frames beyond weight and impedance:
+   * the composition the scale measured, an algorithm byte, a protocol record.
+   * The adapter that emitted the reading defines `C` and is its only reader.
+   *
+   * Set at emit time, never read back from the adapter's live cache: on the
+   * watcher transports the next session can start before this reading reaches
+   * `computeMetrics()` (#394). Plain data only, so a copy of the reading keeps
+   * it (ADR D077). Exporters never see it, only the `computeMetrics()` output.
+   */
+  scaleComposition?: C;
 }
 
 export interface UserProfile {
@@ -45,20 +132,66 @@ export interface UserProfile {
    * provisioning does not have to invent a 1 January anniversary (#229).
    */
   birthDate?: string;
+  /**
+   * Best estimate of what this person weighs, in kg, for protocols that send a
+   * weight anchor to the scale before the weigh-in (QN, #75/#235).
+   *
+   * Not used by body composition, which derives everything from the measured
+   * weight. Resolved from `users[].last_known_weight` when config has one and
+   * from the midpoint of `users[].weight_range` otherwise, so it is populated
+   * for every configured user without a new setting.
+   */
+  lastKnownWeight?: number;
+  /**
+   * false (`users[].estimate_body_composition`, #497): for a weigh-in the scale
+   * measured no body composition for, export none instead of the BMI
+   * (Deurenberg) estimate. Undefined means true.
+   */
+  estimateBodyComposition?: boolean;
 }
 
 export interface BodyComposition {
   weight: number;
   impedance: number;
   bmi: number;
-  bodyFatPercent: number;
-  waterPercent: number;
-  boneMass: number;
-  muscleMass: number;
-  visceralFat: number;
-  physiqueRating: number;
+  // The six composition values below are null only when the user turned the
+  // BMI estimate off and the scale measured nothing for this weigh-in (#497).
+  // BMI, BMR and metabolic age come from weight, height, age and sex, never
+  // from body fat, so they are always there.
+  bodyFatPercent: number | null;
+  waterPercent: number | null;
+  boneMass: number | null;
+  muscleMass: number | null;
+  visceralFat: number | null;
+  physiqueRating: number | null;
   bmr: number;
   metabolicAge: number;
+  /**
+   * The skeletal muscle percentage the scale itself reports (#497). Present
+   * only when the scale measured it, next to a body fat value buildPayload
+   * accepted, and inside its band; absent otherwise, never estimated. The
+   * skeletal estimate in buildPayload stays the physique rating's input
+   * (D002). Each vendor defines it its own way, so it does not compare across
+   * brands.
+   */
+  skeletalMusclePercent?: number;
+  /**
+   * Segment impedances in ohm, at 20 and 100 kHz (#497): diagnostic values an
+   * eight-electrode scale measures. Present only when the scale sent them,
+   * each on its own (0 and the 0xFFFF sentinel are left out), whether or not
+   * its body composition was used; never estimated, and no whole-body
+   * impedance is derived from them.
+   */
+  impedanceTrunk20kHz?: number;
+  impedanceTrunk100kHz?: number;
+  impedanceLeftArm20kHz?: number;
+  impedanceLeftArm100kHz?: number;
+  impedanceRightArm20kHz?: number;
+  impedanceRightArm100kHz?: number;
+  impedanceLeftLeg20kHz?: number;
+  impedanceLeftLeg100kHz?: number;
+  impedanceRightLeg20kHz?: number;
+  impedanceRightLeg100kHz?: number;
 }
 
 /** Describes a BLE characteristic binding for multi-char adapters. */
@@ -82,6 +215,23 @@ export interface CharacteristicBinding {
    * the char is missing.
    */
   optional?: boolean;
+  /**
+   * A `notify` binding the handler does NOT subscribe to. The adapter turns it
+   * on itself, from `onConnected`, with `ctx.subscribe`, once it has written
+   * whatever the scale needs first. A SIG Weight Scale that is told the time
+   * before its indications are enabled is the case this exists for (#408): in
+   * multi-char mode the handler otherwise enables every notify binding before
+   * `onConnected` runs.
+   *
+   * Required unless `optional` is also set, and only valid on a `notify`
+   * binding of an adapter that has `onConnected` (registry-check enforces
+   * both). On the node-ble transport the handler turns such a binding off again
+   * (StopNotify) after a successful session, before it disconnects: a bonded
+   * peer keeps its CCCD across connections, and one left on can indicate in
+   * the next connection before the adapter has written anything or anyone is
+   * listening.
+   */
+  deferred?: boolean;
 }
 
 /**
@@ -126,9 +276,31 @@ export interface ConnectionContext {
   scaleAuth?: ScaleAuth;
   /**
    * Device identifier used by adapters that derive keys from MAC (e.g. Eufy T9148/T9149).
-   * Uppercase, no separators. Empty string when unavailable (e.g. macOS CoreBluetooth UUID).
+   * Uppercase, no separators. Not always a MAC: on macOS the noble transport hands over
+   * the CoreBluetooth peripheral UUID (32 hex digits) instead, since CoreBluetooth does
+   * not reveal the address. An adapter that needs the MAC checks it with
+   * `ownAddressBytes()` (match-descriptor.ts) and treats anything else as unknown.
    */
   deviceAddress: string;
+  /**
+   * Advertised local name of the connected device, as the transport saw it.
+   * Absent when the transport has none (a nameless advertisement, an ESP32
+   * autonomous connect without a cached advertisement). Lets an adapter whose
+   * protocol differs by model pick the variant, e.g. the Medisana time epoch.
+   */
+  deviceName?: string;
+  /**
+   * Manufacturer data of the advertisement the transport matched the device on,
+   * in the same shape as `BleDeviceInfo.manufacturerData` (company id apart,
+   * `data` without it), or, where that one had none, the last one the same
+   * address advertised earlier in this process (node-ble, noble, esphome-proxy;
+   * #463). Absent when the transport had none at all; those three never hand
+   * over a company id without bytes. Lets an adapter read per-unit flags a
+   * scale only announces there, e.g. the QN impedance encoding (#461); since it
+   * can be from an earlier advertisement of the unit, read only fields that do
+   * not change between its advertisements.
+   */
+  manufacturerData?: { id: number; data: Buffer };
   /**
    * Set of characteristic UUIDs (normalized 32-char hex, lowercase) that were
    * actually discovered on the connected device. Adapters with `optional`
@@ -140,40 +312,51 @@ export interface ConnectionContext {
 }
 
 /**
+ * What config says one user weighs (`users[].weight_range`, `last_known_weight`),
+ * for an adapter that has to choose between two readings of one raw value: the
+ * QN weight divisor when the frame that names it is lost (review C-06).
+ *
+ * Structurally a subset of the user's config entry, and the composition root
+ * passes those entries themselves, so a `last_known_weight` the runtime moves
+ * in memory after a weigh-in is visible here without a reload.
+ */
+export interface UserWeightHint {
+  readonly weight_range: { readonly min: number; readonly max: number };
+  readonly last_known_weight: number | null;
+}
+
+/**
  * Per-device runtime configuration injected into adapters at startup (and on
  * config reload) by the composition root. Distinct from the static registry:
  * carries credentials that only exist in the user's config, e.g. the Xiaomi
  * S800 MiBeacon bind key. Adapters that do not need it omit `configure`.
  */
 export interface AdapterRuntimeConfig {
-  /** MiBeacon bind key (32 hex chars) for broadcast-encrypted scales (Xiaomi S800). */
+  /** MiBeacon bind key (32 hex chars) for broadcast-encrypted scales (Xiaomi S800 / S400). */
   bindKey?: string;
   /**
-   * Configured display unit (`scale.weight_unit`). Adapters whose protocol tells
-   * the scale which unit to show (e.g. the QN 0x13 config command) honour this so
-   * a read does not flip the scale's display (#269). Optional and ignored by
-   * adapters that do not write a unit.
+   * Effective scale address (`ble.scale_mac` or `SCALE_MAC`). MiBeacon adapters
+   * use it as the AES-CCM nonce MAC when a frame omits its own (the S400
+   * measurement frame) and no MAC-carrying frame was seen yet. Ignored by
+   * adapters that do not decrypt broadcasts.
    */
-  weightUnit?: WeightUnit;
+  scaleMac?: string;
   /**
-   * Protocol byte the QN handshake echoes back (`ble.qn_protocol_byte`).
-   *
-   * The value the firmware accepts differs across the family and cannot be
-   * detected: a scale on the wrong byte acknowledges every command and simply
-   * never streams a weight, which looks identical to nobody standing on it.
-   * The frame length picks a default; this overrides it (#75, #331).
+   * Unit to ask the scale's own display to show (`scale.display_unit`, with its
+   * `weight_unit` default already resolved by resolveDisplayUnit). Independent of
+   * the unit readings are exported in. Adapters whose protocol tells the scale
+   * which unit to show (the QN 0x13 config command, the AC 27 D0 profile frame)
+   * honour it so a read does not flip the display (#269, #429). Ignored by every
+   * other adapter.
    */
-  qnProtocolByte?: number;
+  displayUnit?: ScaleDisplayUnit;
+  /** Every configured user's weight hints, in config order (see UserWeightHint). */
+  userWeights?: readonly UserWeightHint[];
   /**
-   * Payload byte of the QN A00D history-response frame (`ble.qn_report_byte`).
-   *
-   * Defaults to 0xFE, the value openScale's ES-30M capture uses. Two vendor-app
-   * captures on other firmware in the family send 0xFC instead, from sessions
-   * that read successfully where this adapter saw the whole handshake
-   * acknowledged and then silence. What the byte selects is not decoded, so it
-   * is a setting rather than a changed default (#235, #75, #331).
+   * The adapter-owned `ble.*` keys, camelCased (`qn_user_key` -> `qnUserKey`,
+   * D076). The adapter that owns a key types it in its own configure().
    */
-  qnReportByte?: number;
+  readonly [option: string]: unknown;
 }
 
 /**
@@ -196,9 +379,6 @@ export interface ScaleAdapterCore {
    */
   readonly match?: MatchDescriptor;
 
-  /** True if parseNotification() already converts any non-kg reading to kg. */
-  readonly normalizesWeight?: boolean;
-
   /**
    * True if this adapter's characteristics need a bonded/encrypted BLE link
    * (e.g. the SIG User Data Service on the Beurer BF720). The node-ble handler
@@ -206,6 +386,36 @@ export interface ScaleAdapterCore {
    * Best-effort: a pairing failure is logged and the read proceeds unbonded.
    */
   readonly requiresBonding?: boolean;
+
+  /**
+   * True for a scale that keeps a single bond and pairs Just Works, without a
+   * PIN (#408, A&D UC-352BLE). On Linux the kernel answers such a scale's own
+   * Security Request with a bonding pairing as soon as we connect, so merely
+   * connecting to it pairs it with this host and unpairs the vendor app.
+   *
+   * The node-ble transport therefore never picks such a scale in
+   * auto-discovery: it is used only when `ble.scale_mac` names it. Its
+   * `ensureBonded` may also take the BlueZ default-agent role for the pairing
+   * (only while the scale is not paired yet) and warns once when BlueZ paired
+   * without storing a bond. Meaningful only together with `requiresBonding`.
+   * Not enforced on the other transports, which our code never pairs on.
+   */
+  readonly singleBond?: boolean;
+
+  /**
+   * Whether the scale's advertisement says it holds a weigh-in nobody has
+   * fetched yet: true, false, or undefined when the advertisement does not
+   * say (#471, D063). Meaningful only together with `requiresBonding`.
+   *
+   * Used for one thing only: when a pairing on the scale went unconfirmed and
+   * the node-ble transport holds the next one back, a change from false to
+   * true means somebody just weighed in, so pairing is tried at once instead
+   * of after the wait. Nothing else reads it. A wrong answer costs one pairing
+   * attempt too many per false step to true, or one too few; a hook that keeps
+   * flipping is never worse than no hold at all. Must not throw and must not
+   * do I/O: it runs on every advertisement while the pairing is held back.
+   */
+  advertisesPendingReading?(device: BleDeviceInfo): boolean | undefined;
 
   /**
    * Receive per-device runtime config (e.g. a MiBeacon bind key) from the
@@ -225,8 +435,64 @@ export interface ScaleAdapterCore {
   onConnected?(context: ConnectionContext): Promise<void> | void;
 
   /**
+   * Called once at the start of a GATT session, before any characteristic is
+   * subscribed and therefore before the first frame can be parsed.
+   *
+   * This is where an adapter clears per-session state. Neither of the other two
+   * hooks can do that job (#394):
+   *
+   *   - `onSessionEnd` runs inside `finishWith`, which is BEFORE the resolved
+   *     reading reaches `computeMetrics`. Clearing a composition cache there
+   *     deletes fat/water/muscle/bone from the reading that just completed.
+   *   - `onConnected` pre-empts the legacy unlock, so an `Unlockable` adapter
+   *     that declares it never wakes its scale.
+   *
+   * Adapters are shared singletons. Without this an adapter cannot tell a fresh
+   * weigh-in from the previous one, and a stale cached weight or completeness
+   * flag lets the next session resolve on the last person's data.
+   *
+   * It clears GATING state safely, but it is NOT a safe place to clear state a
+   * previous reading's `computeMetrics` still needs. Session N+1's
+   * `onSessionStart` is not ordered after session N's `computeMetrics`: on the
+   * watcher transports the watcher keeps running while `loop.ts` awaits
+   * `processReading()` (network exports included) and can open the next GATT
+   * session in the meantime. An adapter that carries composition out of band in
+   * its own fields must put it on the reading it belongs to
+   * (`ScaleReading.scaleComposition`), taking the snapshot at emit time, rather
+   * than read the live cache in `computeMetrics`.
+   *
+   * It is a GATT-session hook only. The broadcast path never opens a session,
+   * so `parseBroadcast` / `parseServiceData` run without it ever firing. Adding
+   * a broadcast parser to an adapter that relies on this reset would silently
+   * bypass it; today every such adapter either has no broadcast parser or, like
+   * `eufy-p2`, has a stateless one. `silvergear-108` is broadcast only and keeps
+   * gating state across advertisements, so it keys that state by the MAC in its
+   * own payload instead of relying on this hook.
+   *
+   * Must not throw and must not perform I/O: nothing is connected yet. Reading
+   * a value the adapter already recorded is fine, which is what the address is
+   * for: an adapter that keeps per-device state can resolve it here, for the
+   * device this session is about to read, rather than carrying whatever
+   * `matches()` last saw.
+   *
+   * `deviceAddress` is uppercase with no separators, and it is NOT always a
+   * MAC: on macOS the noble transport supplies the CoreBluetooth UUID instead,
+   * which will simply not match anything recorded from an advertisement. Treat
+   * an unrecognised address as "unknown", never as a reason to reset.
+   */
+  onSessionStart?(deviceAddress?: string): void;
+
+  /**
    * Called once when a GATT session ends, however it ends: a completed reading,
    * a disconnect, a timeout or an init failure.
+   *
+   * NOT a place to clear state a later `computeMetrics` reads: this runs before
+   * the reading is handed to the caller. Use `onSessionStart` for that (#394).
+   *
+   * It is also weaker than it looks. A timeout abandons the read promise rather
+   * than cancelling it, so this fires only once a disconnect event follows, and
+   * the ESPHome proxy scan path can drop a session without reaching cleanup at
+   * all. Treat it as best effort for releasing references, not as a guarantee.
    *
    * Adapters are shared singletons, so anything captured from a
    * `ConnectionContext` (a write function, a queued frame, a negotiated
@@ -239,14 +505,29 @@ export interface ScaleAdapterCore {
   onSessionEnd?(): void;
 
   /**
-   * Set only on the wrapper produced by `ble.force_scale_adapter`.
+   * De-duplication state that has to survive a process restart (review D-15).
    *
-   * Detection normally guarantees that an adapter was selected BY the
-   * advertisement in front of it, and parts of the pipeline lean on that. A
-   * forced adapter breaks the guarantee on purpose, so those places need to be
-   * able to tell (see `hasParseableBroadcastSource`).
+   * For a scale that answers every session from a store it never clears
+   * (Salter), the only thing between a weigh-in and its second export is a
+   * high-water mark of what was already reported. Kept in memory it started at
+   * zero after every deploy, crash or add-on restart, and a record still inside
+   * the adapter's own age bound went out again. The runtime reads this after it
+   * has processed a reading from the adapter and writes it next to config.yaml
+   * (`src/runtime/dedup-marks.ts`); at startup it hands the stored value back
+   * through `restoreDedupMark`. The adapter itself never does I/O.
+   *
+   * The value is opaque to the runtime: a number in whatever domain the
+   * adapter's protocol counts in (Salter: the scale's own clock). Undefined
+   * means "no mark", and the stored one is then dropped.
    */
-  readonly isForcedOverride?: boolean;
+  dedupMark?(): number | undefined;
+
+  /**
+   * Take back a mark `dedupMark` returned in an earlier process. Called once at
+   * startup, before the first session. Must validate the value, since it comes
+   * from a file anyone can edit, and must not throw or perform I/O.
+   */
+  restoreDedupMark?(mark: number): void;
 
   matches(device: BleDeviceInfo): boolean;
   parseNotification(data: Buffer): ScaleReading | null;
@@ -273,6 +554,21 @@ export interface GattWiring {
    * charNotifyUuid + charWriteUuid pair.
    */
   readonly characteristics?: CharacteristicBinding[];
+  /**
+   * True for a frame that only answers a command of ours, or reports the scale's
+   * own state, and so says nothing about a weigh-in: the Yunmai answers every
+   * GET_PROTOCOL_VERSION we write, every 5 s, with a 5-byte 0x05 frame (#474).
+   * Such a frame does not restart the session's idle timeout; every other frame
+   * does, including frames the parser rejects, since an unstable QN 0x10 is a
+   * weigh-in in progress. It is still logged, acknowledged (buildAck) and parsed,
+   * and it still counts as the scale having answered (the node-ble no-reading
+   * classification, D041).
+   *
+   * Return true only for a frame type the protocol defines as such a reply or
+   * report, never for one that may carry a weight. Must not throw and must not do
+   * I/O: it runs on every notification. GATT only (D070).
+   */
+  isStatusFrame?(charUuid: string, data: Buffer): boolean;
 }
 
 /**
@@ -298,6 +594,9 @@ export interface Unlockable {
  * dual GATT+broadcast). This is a NAMED OPTIONAL GROUPING, not a hard contract:
  * `implements BroadcastSource` documents intent and shape-checks whatever member
  * the class declares, but does not force any single member to exist.
+ *
+ * The parsers may keep state (settling, de-dup, a cached key), so a caller
+ * hands each advertisement to them once.
  */
 export interface BroadcastSource {
   /**
@@ -314,6 +613,19 @@ export interface BroadcastSource {
   parseBroadcast?(manufacturerData: Buffer): ScaleReading | null;
 
   /**
+   * Parse a settling weight from advertisement manufacturer data (#356).
+   *
+   * Called only for frames `parseBroadcast` returned null for, so an adapter
+   * MUST NOT return a value here for a frame it would have accepted there: one
+   * frame reported through both channels would show a display a number twice
+   * and, worse, blur the line this type exists to draw.
+   *
+   * The result reaches a live display and nothing else. It is not a reading, it
+   * never completes a session, and it can never be exported.
+   */
+  parseLiveBroadcast?(manufacturerData: Buffer): LiveWeight | null;
+
+  /**
    * Parse a weight reading from a single BLE advertisement service-data entry.
    * Called for each service-data UUID/value pair on each advertisement. Return
    * null to keep waiting. Combine with preferPassive=true to skip GATT entirely.
@@ -328,8 +640,7 @@ export interface BroadcastSource {
  * UUID so the adapter can route by char. This is a GATT notify concern (it pairs
  * with GattWiring `characteristics` and an `onConnected` handshake), NOT a
  * passive-broadcast parser, which is why it is its own mixin and not part of
- * BroadcastSource. Declared by trisa, beurer-bf720, eufy-p2, robi-s9, ade-a2,
- * renpho, renpho-msc04 and qn-scale.
+ * BroadcastSource.
  */
 export interface MultiCharNotify {
   /**
@@ -369,6 +680,18 @@ export interface AckProtocol {
  * `completionHoldMs`, still feeding frames, so a richer reading (e.g.
  * bioimpedance composition arriving a few seconds after the weight settles) can
  * land. On timeout the last complete reading resolves.
+ *
+ * GATT only. It is read by `waitForRawReading` and nowhere on the broadcast
+ * path, which some adapters rely on (`eufy-p2` declares it for its GATT session
+ * and also parses broadcasts). The broadcast equivalent is `preferPassive` with
+ * an `isComplete` that returns false for the early reading. The streaming
+ * broadcast paths (every continuous-mode watcher, and the single-shot scans of
+ * noble, node-ble, ESPHome proxy and Home Assistant Bluetooth) hold such a
+ * partial reading for up to `IMPEDANCE_GRACE_MS`, resolve early on a later
+ * complete one, and keep listening past their scan deadline until one of those
+ * two happens (Mi Scale 2, Silvergear 108). The mqtt-proxy single-shot scan is the
+ * exception: it reads one scan snapshot, cannot wait for a later frame, and
+ * returns the partial reading at once when nothing complete is in it.
  */
 export interface HoldForComposition {
   /**
@@ -388,6 +711,14 @@ export interface HoldForComposition {
    * hold window. Only consulted while completionHoldMs is set.
    */
   isFinal?(reading: ScaleReading): boolean;
+  /**
+   * True while a multipart composition transfer has started but not finished.
+   * When the hold window elapses during one, the handler extends it in short
+   * steps up to a fixed cap instead of resolving with the weight alone, so a
+   * slow link does not cut off the parts that carry the impedance (#211).
+   * Only consulted while completionHoldMs is set.
+   */
+  isCompositionPending?(): boolean;
 }
 
 /**
@@ -400,10 +731,48 @@ export interface HoldForComposition {
  * `implements ScaleAdapterCore, GattWiring, Unlockable` for author-facing
  * clarity and compile-time checking of that specific bundle.
  */
+/**
+ * Unlockable, or nothing of it.
+ *
+ * `Partial<Unlockable>` made every member independently optional, so an adapter
+ * could declare `unlockIntervalMs` with no command to send - a timer that fires
+ * forever and writes nothing. The two members are only meaningful together, and
+ * that is the whole constraint: this is not a general rewrite of the capability
+ * system, just the pairing the interface already documents.
+ */
+type MaybeUnlockable =
+  | {
+      readonly unlockCommand?: undefined;
+      readonly unlockCommands?: undefined;
+      readonly unlockIntervalMs?: undefined;
+    }
+  | Unlockable;
+
+/**
+ * BroadcastSource, with the one rule its own doc comment states.
+ *
+ * "Adapters that set this must implement parseServiceData or parseBroadcast"
+ * was a sentence, not a type: `preferPassive: true` with neither parser
+ * compiled, and it means an adapter that refuses to connect over GATT and
+ * cannot read an advertisement either - a scale that can never produce a
+ * reading. Everything else in the capability stays deliberately optional, as
+ * BroadcastSource documents.
+ */
+type MaybeBroadcastSource =
+  | (Partial<BroadcastSource> & { readonly preferPassive?: false | undefined })
+  | (Partial<BroadcastSource> & {
+      readonly preferPassive: true;
+      parseBroadcast(manufacturerData: Buffer): ScaleReading | null;
+    })
+  | (Partial<BroadcastSource> & {
+      readonly preferPassive: true;
+      parseServiceData(uuid: string, data: Buffer): ScaleReading | null;
+    });
+
 export type ScaleAdapter = ScaleAdapterCore &
   Partial<GattWiring> &
-  Partial<Unlockable> &
-  Partial<BroadcastSource> &
+  MaybeUnlockable &
+  MaybeBroadcastSource &
   Partial<MultiCharNotify> &
   Partial<AckProtocol> &
   Partial<HoldForComposition>;

@@ -8,7 +8,7 @@ import type {
   UserProfile,
   BodyComposition,
 } from '../interfaces/scale-adapter.js';
-import { uuid16, buildPayload, computeBiaFat, xorChecksum } from './body-comp-helpers.js';
+import { uuid16, xorChecksum, biaPayload } from './body-comp-helpers.js';
 import type { MatchDescriptor } from './match-descriptor.js';
 
 const CHR_NOTIFY = uuid16(0xfff4);
@@ -71,7 +71,6 @@ export class KoogeekS1Adapter
   };
   readonly charNotifyUuid = CHR_NOTIFY;
   readonly charWriteUuid = CHR_WRITE;
-  readonly normalizesWeight = true;
   /**
    * 0xFFF3 is a vendor OEM command characteristic. Every other adapter in the
    * 0xFFF0 family writes without a response, so we do the same.
@@ -173,8 +172,11 @@ export class KoogeekS1Adapter
   }
 
   computeMetrics(reading: ScaleReading, profile: UserProfile): BodyComposition {
-    const fat =
-      reading.impedance > 0 ? computeBiaFat(reading.weight, reading.impedance, profile) : undefined;
-    return buildPayload(reading.weight, reading.impedance, { fat }, profile);
+    // biaFatIfPlausible, not computeBiaFat: the latter bounds its output but
+    // not its input, so an impedance outside 150-1200 ohm pins the 4 % floor or
+    // the 60 % ceiling and publishes it as a confident number (#405). Rejected
+    // means the Deurenberg estimate, which is what this adapter published
+    // before the impedance was read at all.
+    return biaPayload(reading, profile);
   }
 }

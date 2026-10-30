@@ -2,210 +2,24 @@ import type {
   ScaleAdapter,
   UserProfile,
   ScaleReading,
-  BodyComposition,
-  BleDeviceInfo,
   ConnectionContext,
   ScaleAuth,
 } from '../interfaces/scale-adapter.js';
-import type { WeightUnit } from '../config/schema.js';
-import { LBS_TO_KG, normalizeUuid, errMsg, bleLog } from './types.js';
+import { errMsg, bleLog } from './types.js';
 import { HistoryBuffer, HoldTimer } from './notification-processor.js';
-
-// ─── Raw frame capture (protocol debugging) ───────────────────────────────────
-
-/** Default hold window after a complete reading while capturing trailing frames. */
-const RAW_CAPTURE_DEFAULT_HOLD_MS = 20_000;
-
-/** Format a buffer as a space-separated lowercase hex string (e.g. "e7 58 01"). */
-export function toHex(buf: Buffer | number[]): string {
-  return [...buf].map((b) => b.toString(16).padStart(2, '0')).join(' ');
-}
-
-/**
- * Env-gated raw BLE frame capture for protocol reverse-engineering (#211).
- *
- * When enabled, `waitForRawReading()` logs every notify frame as hex (including
- * frames the adapter parses to null, e.g. the Beurer/Sanitas 0x59 composition
- * frame) and holds the GATT connection open past the weight-stable point so the
- * scale actually transmits its trailing frames before we disconnect.
- *
- *   BLE_RAW_CAPTURE          truthy enables (off for unset/empty/0/false/no/off)
- *   BLE_RAW_CAPTURE_HOLD_SEC optional hold window in seconds (default 20)
- *
- * Read from the environment on each call so tests can toggle it without a module
- * reload. Off by default; has no effect on normal runs.
- */
-export function getRawCaptureConfig(): { enabled: boolean; holdMs: number } {
-  const raw = (process.env.BLE_RAW_CAPTURE ?? '').trim().toLowerCase();
-  const enabled = raw !== '' && raw !== '0' && raw !== 'false' && raw !== 'no' && raw !== 'off';
-  const holdSec = Number(process.env.BLE_RAW_CAPTURE_HOLD_SEC);
-  const holdMs =
-    Number.isFinite(holdSec) && holdSec > 0 ? holdSec * 1000 : RAW_CAPTURE_DEFAULT_HOLD_MS;
-  return { enabled, holdMs };
-}
-
-// ─── Broadcast-vs-GATT routing ────────────────────────────────────────────────
-
-/**
- * True when the matched device still carries broadcast/service data this
- * adapter can parse — a usable reading may yet arrive in a future
- * advertisement, so the caller should keep waiting rather than opening a GATT
- * connection.
- *
- * False when the device exposes no parseable broadcast source: a dual-mode
- * adapter (e.g. QN Scale, which declares `parseBroadcast` for the AABB
- * broadcast variant but also has a GATT path) must then fall through to its
- * GATT path. This is the #201 fix — the scan-batch proxy paths previously let
- * any adapter that merely *declared* `parseBroadcast`/`parseServiceData` skip
- * GATT entirely, so GATT-only QN scales (which advertise just a name + service
- * UUID, no manufacturer data) were matched and then silently dropped.
- *
- * Known limitation (Option B): any `manufacturerData` counts as a broadcast
- * source even if `parseBroadcast` would reject it. A QN scale advertising
- * non-AABB manufacturer data would therefore be gated to "wait" — this matches
- * the pre-#201 behaviour, so it is no regression. GATT-only QN scales
- * advertise no manufacturer data at all, so they are unaffected. The
- * esphome-proxy *watcher* intentionally does not use this helper: its
- * per-advertisement stream GATT-connects such devices instead (QN Elis 1).
- */
-export function hasParseableBroadcastSource(adapter: ScaleAdapter, info: BleDeviceInfo): boolean {
-  // A forced adapter (ble.force_scale_adapter) is exempt from the "any
-  // manufacturer data counts" shortcut above, because the shortcut assumes the
-  // adapter was chosen BY that advertisement. A forced one was not: it claims
-  // every device it is shown, so a dual-mode adapter like QN or Eufy P2 pointed
-  // at a scale whose manufacturer data it cannot parse would return "wait"
-  // forever and the GATT path would never run. Here the parse must actually
-  // succeed.
-  const forced = adapter.isForcedOverride === true;
-  if (adapter.parseBroadcast && info.manufacturerData) {
-    if (!forced) return true;
-    if (adapter.parseBroadcast(info.manufacturerData.data) !== null) return true;
-  }
-  if (adapter.parseServiceData && info.serviceData && info.serviceData.length > 0) {
-    if (!forced) return true;
-    if (info.serviceData.some((sd) => adapter.parseServiceData!(sd.uuid, sd.data) !== null)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// ─── Thin abstractions over BLE library objects ───────────────────────────────
-
-export interface BleChar {
-  /** Subscribe to notifications. Returns an unsubscribe function to remove the listener. */
-  subscribe(onData: (data: Buffer) => void): Promise<() => void>;
-  write(data: Buffer, withResponse: boolean): Promise<void>;
-  read(): Promise<Buffer>;
-}
-
-export interface BleDevice {
-  onDisconnect(callback: () => void): void;
-}
-
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
-function resolveChar(charMap: Map<string, BleChar>, uuid: string | undefined): BleChar | undefined {
-  if (uuid === undefined) return undefined;
-  return charMap.get(normalizeUuid(uuid));
-}
-
-/**
- * Resolve the characteristic this adapter writes to for handler-driven writes
- * (per-frame ACKs). Prefers the `characteristics[]` write binding so a
- * multi-char adapter that declares no legacy `charWriteUuid` can still ack,
- * then falls back to the legacy `charWriteUuid` / `altCharWriteUuid` pair.
- * Returns undefined when no write char is present (caller no-ops).
- */
-export function resolveWriteChar(
-  charMap: Map<string, BleChar>,
-  adapter: ScaleAdapter,
-): BleChar | undefined {
-  if (adapter.characteristics) {
-    const writeBinding = adapter.characteristics.find((b) => b.type === 'write');
-    if (writeBinding) {
-      const char = resolveChar(charMap, writeBinding.uuid);
-      if (char) return char;
-    }
-  }
-  return (
-    resolveChar(charMap, adapter.charWriteUuid) ??
-    (adapter.altCharWriteUuid ? resolveChar(charMap, adapter.altCharWriteUuid) : undefined)
-  );
-}
-
-/**
- * Validate that a charMap contains every characteristic the adapter needs.
- *
- * Returns the list of missing UUIDs (empty when the map is complete). Handles
- * both multi-char adapters (`characteristics` bindings) and legacy adapters
- * (single notify + write with optional alt UUIDs).
- *
- * Callers use this after `buildCharMap` to detect the BlueZ `ServicesResolved`
- * race ([bluez/bluez#1489](https://github.com/bluez/bluez/issues/1489)) where
- * `ServicesResolved=true` fires before all GATT characteristics are exported
- * over D-Bus, yielding a charMap that is missing entries the scale actually
- * exposes. The typical workaround is to wait a few hundred ms and rebuild.
- */
-export function findMissingCharacteristics(
-  charMap: Map<string, BleChar>,
-  adapter: ScaleAdapter,
-): string[] {
-  const missing: string[] = [];
-
-  if (adapter.characteristics) {
-    for (const binding of adapter.characteristics) {
-      if (binding.optional) continue;
-      if (!resolveChar(charMap, binding.uuid)) missing.push(binding.uuid);
-    }
-    return missing;
-  }
-
-  const hasNotify =
-    !!resolveChar(charMap, adapter.charNotifyUuid) ||
-    (!!adapter.altCharNotifyUuid && !!resolveChar(charMap, adapter.altCharNotifyUuid));
-  if (!hasNotify) missing.push(adapter.charNotifyUuid ?? '<no notify uuid>');
-
-  const hasWrite =
-    !!resolveChar(charMap, adapter.charWriteUuid) ||
-    (!!adapter.altCharWriteUuid && !!resolveChar(charMap, adapter.altCharWriteUuid));
-  if (!hasWrite) missing.push(adapter.charWriteUuid ?? '<no write uuid>');
-
-  return missing;
-}
-
-/** ` for adapter "X"`, or nothing when the adapter is unknown. */
-function adapterSuffix(adapterName?: string): string {
-  return adapterName ? ` for adapter "${adapterName}"` : '';
-}
-
-/** Subscribe to a GATT characteristic and forward notifications to the handler.
- *  Returns the unsubscribe function from the BleChar. */
-async function subscribeToChar(
-  charMap: Map<string, BleChar>,
-  charUuid: string,
-  onNotification: (sourceUuid: string, data: Buffer) => void,
-  adapterName?: string,
-): Promise<() => void> {
-  const char = resolveChar(charMap, charUuid);
-  // Name the adapter: this almost always means the wrong adapter was selected
-  // for the device, and without the name the log gives no way to see that
-  // (#317, #319).
-  if (!char) throw new Error(`Characteristic ${charUuid} not found${adapterSuffix(adapterName)}`);
-  const normalized = normalizeUuid(charUuid);
-  return char.subscribe((data: Buffer) => onNotification(normalized, data));
-}
+import { isHistoricalReading } from '../interfaces/reading-time.js';
+import { createWriteLanes, type WriteLanes } from './write-lane.js';
+import { getRawCaptureConfig, toHex } from './session/capture.js';
+import type { BleChar, BleDevice } from './session/ports.js';
+import { adapterSuffix, resolveChar, resolveWriteChar, subscribeToChar } from './session/wiring.js';
 
 /** Run adapter.onConnected() or fall back to legacy unlock-command interval. */
 function initializeAdapter(
-  charMap: Map<string, BleChar>,
-  adapter: ScaleAdapter,
-  profile: UserProfile,
-  deviceAddress: string,
+  { charMap, adapter, profile, address, scaleAuth, deviceName, manufacturerData }: SessionRequest,
   isResolved: () => boolean,
   onNotification: (sourceUuid: string, data: Buffer) => void,
   unsubscribers: (() => void)[],
-  scaleAuth?: ScaleAuth,
+  lanes: WriteLanes,
 ): {
   start: () => Promise<void>;
   cleanup: () => void;
@@ -222,6 +36,15 @@ function initializeAdapter(
    */
   resendUnlockAfterSubscribe: () => Promise<void>;
 } {
+  // Before anything is subscribed, so no frame can be parsed against the
+  // previous session's state. It has to be here rather than in `start()`,
+  // because `subscribeAndInit` subscribes first and calls `start` after (#394).
+  try {
+    adapter.onSessionStart?.(address);
+  } catch (e: unknown) {
+    bleLog.debug(`Adapter onSessionStart failed: ${errMsg(e)}`);
+  }
+
   let unlockInterval: ReturnType<typeof setInterval> | null = null;
   let resendUnlock: (() => Promise<void>) | null = null;
 
@@ -247,6 +70,9 @@ function initializeAdapter(
   let sessionEnded = false;
   const cleanup = (): void => {
     closed = true;
+    // Drops a queued unlock; a queued ACK or adapter write still goes out (see
+    // write-lane.ts, rule 5).
+    lanes.close();
     if (unlockInterval) {
       clearInterval(unlockInterval);
       unlockInterval = null;
@@ -273,13 +99,19 @@ function initializeAdapter(
       const ctx: ConnectionContext = {
         profile,
         scaleAuth,
-        deviceAddress,
+        deviceAddress: address,
+        ...(deviceName ? { deviceName } : {}),
+        ...(manufacturerData ? { manufacturerData } : {}),
         availableChars,
         write: async (charUuid, data, withResponse = true) => {
           const char = resolveChar(charMap, charUuid);
           if (!char) throw new Error(`Characteristic ${charUuid} not found`);
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          await char.write(buf, withResponse);
+          // Through the session's lane, not straight to the char: BlueZ refuses
+          // a second write to a characteristic while one with a response is
+          // still open (#211). Called before the first await, so an idle lane
+          // still puts the write on the wire synchronously (#370).
+          await lanes.write(char, buf, withResponse, 'adapter');
         },
         read: async (charUuid) => {
           const char = resolveChar(charMap, charUuid);
@@ -314,7 +146,7 @@ function initializeAdapter(
         if (isResolved()) return;
         for (const buf of commands) {
           try {
-            await writeChar.write(buf, false);
+            await lanes.write(writeChar, buf, false, 'unlock');
             bleLog.debug(`Unlock write: [${toHex(buf)}]`);
           } catch (e: unknown) {
             if (!isResolved()) bleLog.error(`Unlock write error: ${errMsg(e)}`);
@@ -323,8 +155,8 @@ function initializeAdapter(
       };
 
       sendUnlock();
-      // `unlockIntervalMs: 0` means "send the unlock once", and four adapters
-      // declare exactly that (Active Era, ES-CS20M, Hesley, 1byone new). `??`
+      // `unlockIntervalMs: 0` means "send the unlock once", and three adapters
+      // declare exactly that (Active Era, Hesley, 1byone new). `??`
       // does not catch 0, so they used to arm setInterval(fn, 0), which clamps
       // to about 1 ms on Linux: a write flood for the whole session on every
       // transport. The 5000 ms fallback stays for an adapter that declares
@@ -351,6 +183,58 @@ function initializeAdapter(
   return { start, cleanup, register, resendUnlockAfterSubscribe };
 }
 
+/**
+ * How each `waitForRawReading()` session still in progress on a device ends
+ * itself the way a disconnect ends it, returning what that settled it with,
+ * or, with `handOver` false, only ends it. Read only by withAbandonmentCleanup.
+ */
+const sessionEnders = new WeakMap<
+  BleDevice,
+  (cause: string, handOver?: boolean) => RawReading | undefined
+>();
+
+/** The cause waitForRawReading's own disconnect callback ends a session with. */
+const DISCONNECTED = 'Disconnected';
+
+/**
+ * Run a bounded reading session and make sure an abandoned one cleans up.
+ *
+ * `withTimeout` / `withIdleTimeout` abandon the promise they raced rather than
+ * cancelling it, so when they win, `waitForRawReading()` is left running with
+ * its unlock interval, its notify subscriptions and the adapter's session state
+ * all live. Firing the disconnect drives the one cleanup path that already
+ * exists instead of giving every transport its own (#404).
+ *
+ * The abandoned session also hands over what a disconnect would: the reading
+ * held for body composition, or the stored records it buffered while no live
+ * weigh-in came. Those are returned instead of the timeout error. A timeout used
+ * to drop them, and an adapter that counts a stored record as reported once it
+ * hands it over (`dedupMark`) then never handed it over again: a 19-byte QN
+ * scale that sends its stored weigh-ins and keeps the link up until the idle
+ * timeout lost them for good (#331). On a shutdown (`abortSignal`) the session
+ * is only cleaned up: it is ended before the disconnect is fired, so the
+ * disconnect does not settle it with a reading nobody receives, logged as
+ * "Reading complete" as if it had gone out (#463).
+ */
+export async function withAbandonmentCleanup(
+  bleDevice: BleDevice,
+  run: () => Promise<RawReading>,
+  abortSignal?: AbortSignal,
+): Promise<RawReading> {
+  try {
+    return await run();
+  } catch (err) {
+    const end = sessionEnders.get(bleDevice);
+    sessionEnders.delete(bleDevice);
+    const settled = abortSignal?.aborted
+      ? end?.(`Shutdown (${errMsg(err)})`, false)
+      : end?.(`Gave up waiting (${errMsg(err)})`);
+    bleDevice.fireDisconnect();
+    if (settled) return settled;
+    throw err;
+  }
+}
+
 /** Subscribe to notifications in multi-char or legacy mode, then start adapter init. */
 async function subscribeAndInit(
   charMap: Map<string, BleChar>,
@@ -372,7 +256,16 @@ async function subscribeAndInit(
     }
 
     let subscribed = 0;
+    let deferred = 0;
     for (const binding of notifyBindings) {
+      // The adapter enables it from onConnected, after the writes the scale
+      // expects first (#408). Counted above, so an adapter whose only notify
+      // binding is deferred still passes the check.
+      if (binding.deferred) {
+        bleLog.debug(`Leaving notify binding ${binding.uuid} to the adapter's onConnected`);
+        deferred += 1;
+        continue;
+      }
       if (binding.optional && !resolveChar(charMap, binding.uuid)) {
         bleLog.debug(`Skipping optional notify binding ${binding.uuid} (not present on device)`);
         continue;
@@ -407,7 +300,11 @@ async function subscribeAndInit(
         );
       }
     }
-    bleLog.info(`Subscribed to ${subscribed} notification(s). Step on the scale.`);
+    // With a deferred binding nothing the weigh-in arrives on is enabled yet,
+    // so "step on the scale" would be premature; the adapter says it instead.
+    if (deferred === 0) {
+      bleLog.info(`Subscribed to ${subscribed} notification(s). Step on the scale.`);
+    }
     await startInit();
   } else {
     // Legacy mode — single notify + write pair
@@ -452,7 +349,7 @@ async function subscribeAndInit(
     // The unlock above was necessarily written before notifications were on:
     // noble queues the CCCD write from inside its descriptor discovery
     // callback, so a send-once adapter would otherwise have its reply dropped
-    // and never retry. Repeating it here costs one write on four adapters.
+    // and never retry. Repeating it here costs one write on three adapters.
     await onNotifyEnabled();
   }
 }
@@ -467,6 +364,14 @@ async function subscribeAndInit(
  */
 const MAX_HISTORY_FRAMES = 500;
 
+/**
+ * Margin by which a composition hold keeps the caller's idle timeout and, on
+ * the native handlers, its absolute session cap away, so the hold's own timer,
+ * which resolves with the settled weight, fires first. The proxy handlers'
+ * fixed caps are not moved by it.
+ */
+const HOLD_IDLE_SLACK_MS = 2_000;
+
 /** Raw scale reading paired with the adapter that produced it. */
 export interface RawReading {
   reading: ScaleReading;
@@ -474,7 +379,8 @@ export interface RawReading {
   /**
    * Earlier readings collected during the same GATT session, oldest first.
    * Populated by adapters whose protocol dumps cached offline frames (each
-   * frame carrying `ScaleReading.timestamp`) on reconnect. The primary
+   * frame carrying a `ScaleReading.timestamp` older than `HISTORY_WINDOW_MS`,
+   * or flagged `fromMemory` by its adapter) on reconnect. The primary
    * `reading` is the latest live frame, or, if the scale disconnected after
    * the cache dump without producing a live one, the newest historical
    * frame, with the rest in `history`.
@@ -482,49 +388,80 @@ export interface RawReading {
   history?: ScaleReading[];
 }
 
+/** One GATT reading session: everything waitForRawReading runs on. */
+export interface SessionRequest {
+  charMap: Map<string, BleChar>;
+  device: BleDevice;
+  adapter: ScaleAdapter;
+  profile: UserProfile;
+  /** `ConnectionContext.deviceAddress`; every transport passes it without separators. */
+  address: string;
+  scaleAuth: ScaleAuth | undefined;
+  /** What the device advertised, for `ConnectionContext`. */
+  deviceName?: string;
+  manufacturerData?: { id: number; data: Buffer };
+  onLiveData?: (reading: ScaleReading) => void;
+  /**
+   * Restarts the caller's idle timeout; called for every frame except one the
+   * adapter calls a status frame (`isStatusFrame`, D070).
+   */
+  onActivity?: (minIdleMs?: number) => void;
+  /** Called for every frame, status frames included: the scale answered at all (node-ble, D041). */
+  onFrame?: () => void;
+}
+
 /**
  * Subscribe to GATT notifications and wait for a complete raw scale reading.
  * Returns the reading + adapter WITHOUT computing body composition metrics.
  * Used by the multi-user flow to match a user by weight before computing metrics.
  *
- * Historical readings (those whose `ScaleReading.timestamp` is set by the
- * adapter from a cached-frame age field) are routed into `RawReading.history`
+ * Historical readings (those whose `ScaleReading.timestamp` is older than
+ * `HISTORY_WINDOW_MS`, D027, or that the adapter flagged `fromMemory`, D065)
+ * are routed into `RawReading.history`
  * instead of resolving the Promise. The Promise resolves on the first live
  * frame that passes `isComplete()`. If the scale disconnects after dumping
  * cache but without sending a live frame, the Promise resolves with the
  * newest historical reading as `reading` and the rest in `history`. Reject
- * only fires when no reading at all was collected before disconnect.
+ * only fires when no reading at all was collected before disconnect. A caller
+ * whose timeout gives up gets the same through withAbandonmentCleanup.
  */
-export function waitForRawReading(
-  charMap: Map<string, BleChar>,
-  bleDevice: BleDevice,
-  adapter: ScaleAdapter,
-  profile: UserProfile,
-  deviceAddress: string,
-  weightUnit?: WeightUnit,
-  onLiveData?: (reading: ScaleReading) => void,
-  scaleAuth?: ScaleAuth,
-  onActivity?: () => void,
-): Promise<RawReading> {
+export function waitForRawReading(req: SessionRequest): Promise<RawReading> {
+  const { charMap, device: bleDevice, adapter, onLiveData, onActivity, onFrame } = req;
   return new Promise<RawReading>((resolve, reject) => {
     let resolved = false;
+    // Per session, so every session says it once (D070).
+    let statusFrameLogged = false;
     const history = new HistoryBuffer(MAX_HISTORY_FRAMES, adapter.name);
     const ackWriteChar = resolveWriteChar(charMap, adapter);
+    // One FIFO per characteristic for every write of this session: ACKs, the
+    // legacy unlock and the adapter's own ctx.write (#211).
+    const lanes = createWriteLanes();
 
-    const finishWith = (r: ScaleReading): void => {
+    const finishWith = (r: ScaleReading): RawReading => {
       resolved = true;
       hold.clear();
+      clearCaptureHold();
       init.cleanup();
       process.stdout.write('\r' + ' '.repeat(80) + '\r');
       bleLog.info(`Reading complete: ${r.weight.toFixed(2)} kg / ${r.impedance} Ohm`);
-      resolve({ reading: r, adapter, history: history.snapshot() });
+      const raw: RawReading = { reading: r, adapter, history: history.snapshot() };
+      resolve(raw);
+      return raw;
     };
 
     // Armed only for adapters with completionHoldMs; the hold() call below is
     // gated on it, so a 0 ms timer is never started for other adapters.
-    const hold = new HoldTimer(adapter.completionHoldMs ?? 0, (r) => {
-      if (!resolved) finishWith(r);
-    });
+    const hold = new HoldTimer(
+      () => adapter.completionHoldMs ?? 0,
+      (r) => {
+        if (!resolved) finishWith(r);
+      },
+      // The scale may say nothing for the whole window. Without this a
+      // session_timeout_sec shorter than the hold ends the session first, and
+      // the caller's timeout discards the settled weight along with it (#434).
+      (holdMs) => onActivity?.(holdMs + HOLD_IDLE_SLACK_MS),
+      () => adapter.isCompositionPending?.() === true,
+    );
 
     // Raw frame capture (#211): log every notify frame and hold the connection
     // open past weight-stable so trailing frames (e.g. the Beurer/Sanitas 0x59
@@ -545,9 +482,7 @@ export function waitForRawReading(
       }
       if (resolved) return;
 
-      // Counted before the adapter gate, because a frame the adapter rejects
-      // (an unstable QN 0x10) still shows the scale is mid weigh-in.
-      onActivity?.();
+      onFrame?.();
 
       // Every frame the scale sends, before any adapter gate can discard it.
       // Without this a silent cycle cannot be told apart from one where frames
@@ -559,13 +494,42 @@ export function waitForRawReading(
           .join(' ')}]${data.length > 32 ? ` (+${data.length - 32} bytes)` : ''}`,
       );
 
+      // Counted before the adapter gate, because a frame the adapter rejects
+      // (an unstable QN 0x10) still shows the scale is mid weigh-in. A status
+      // frame does not: counted, the Yunmai's reply to the unlock written every
+      // 5 s kept a session nobody was weighing in on open until its cap (#474,
+      // D070). Asked after the Notification line, so that line is there even
+      // if the hook misbehaves.
+      const status = adapter.isStatusFrame?.(sourceUuid, data) === true;
+      if (!status) onActivity?.();
+      if (status && !statusFrameLogged) {
+        statusFrameLogged = true;
+        bleLog.debug(
+          `${adapter.name}: that frame is a status frame, not part of a weigh-in, ` +
+            'so it does not keep the session open',
+        );
+      }
+
       if (adapter.buildAck && ackWriteChar) {
         const ack = adapter.buildAck(data);
         if (ack) {
           const ackBuf = Buffer.isBuffer(ack) ? ack : Buffer.from(ack);
-          void ackWriteChar.write(ackBuf, adapter.ackWithResponse ?? true).catch((e: unknown) => {
-            if (!resolved) bleLog.debug(`ACK write error: ${errMsg(e)}`);
-          });
+          const ackHex = toHex(ackBuf);
+          // Queued behind any write still open on this characteristic instead
+          // of fired next to it, which BlueZ refused as "In Progress" (#211).
+          // The timing line is there to measure a slow link.
+          void lanes.write(ackWriteChar, ackBuf, adapter.ackWithResponse ?? true, 'ack').then(
+            (t) => {
+              bleLog.debug(
+                t.coalesced
+                  ? `ACK [${ackHex}] coalesced with an identical one still waiting`
+                  : `ACK [${ackHex}] written in ${t.tookMs} ms (waited ${t.waitedMs} ms)`,
+              );
+            },
+            (e: unknown) => {
+              if (!resolved) bleLog.debug(`ACK write error: ${errMsg(e)}`);
+            },
+          );
         }
       }
 
@@ -574,18 +538,23 @@ export function waitForRawReading(
         : adapter.parseNotification(data);
       if (!reading) return;
 
-      if (weightUnit === 'lbs' && !adapter.normalizesWeight) {
-        reading.weight *= LBS_TO_KG;
-      }
-
       if (onLiveData) onLiveData(reading);
 
-      if (reading.timestamp) {
+      // A stored record never ends the session: it is buffered, and the live
+      // weigh-in (or the disconnect) does. "Stored" is decided by AGE, not by
+      // the presence of a stamp (D027): a scale that stamps its live frames too
+      // must still be able to end the session with one, or it would be held
+      // open until the scale gave up and the weigh-in arrived as history.
+      if (isHistoricalReading(reading)) {
         if (!adapter.isComplete(reading)) return;
         if (history.push(reading)) {
+          // A reading flagged fromMemory need not carry a readable stamp
+          // (D065), and toISOString throws on an invalid Date.
+          const ts = reading.timestamp;
+          const at = ts && !Number.isNaN(ts.getTime()) ? ts.toISOString() : 'receipt time';
           bleLog.debug(
             `Historical reading buffered: ${reading.weight.toFixed(2)} kg / ` +
-              `${reading.impedance} Ohm @ ${reading.timestamp.toISOString()}`,
+              `${reading.impedance} Ohm @ ${at}`,
           );
         }
         return;
@@ -625,37 +594,54 @@ export function waitForRawReading(
     };
 
     const unsubscribers: (() => void)[] = [];
-    const init = initializeAdapter(
-      charMap,
-      adapter,
-      profile,
-      deviceAddress,
-      () => resolved,
-      handleNotification,
-      unsubscribers,
-      scaleAuth,
-    );
+    const init = initializeAdapter(req, () => resolved, handleNotification, unsubscribers, lanes);
 
-    bleDevice.onDisconnect(() => {
-      if (resolved) return;
+    /**
+     * End the session as the scale disconnecting does, and return what that
+     * settled it with; undefined when it was already settled or had nothing,
+     * which rejects it. `cause` opens the log lines: the disconnect itself, or
+     * a caller whose timeout gave up (withAbandonmentCleanup). With `handOver`
+     * false (a shutdown) the session only ends: nothing it held or buffered is
+     * settled, since nothing would receive it (D051).
+     */
+    const endSession = (cause: string, handOver = true): RawReading | undefined => {
+      if (resolved) return undefined;
       hold.clear();
       clearCaptureHold();
+      if (!handOver) {
+        resolved = true;
+        init.cleanup();
+        bleLog.debug(`${cause} during the session; nothing is handed over.`);
+        reject(new Error(`Session ended: ${cause}`));
+        return undefined;
+      }
+      // A held live weigh-in wins over the stored records of the same session:
+      // finishWith hands them over as history. Checked first, because with the
+      // history branch first a scale that replays its memory and then
+      // disconnects while a live weight is held lost the live weight entirely
+      // (#331). hold.clear() above stops the timer only, the reading stays.
+      const held = hold.heldReading;
+      if (held) {
+        if (history.length > 0) {
+          bleLog.debug(
+            `${cause} while holding a live reading; ${history.length} historical ` +
+              `reading(s) go out as history.`,
+          );
+        }
+        return finishWith(held);
+      }
       if (history.length > 0) {
         resolved = true;
         init.cleanup();
         const latest = history.popLatest()!;
         process.stdout.write('\r' + ' '.repeat(80) + '\r');
         bleLog.info(
-          `Disconnected after cache replay (${history.length + 1} historical reading(s)); ` +
+          `${cause} after cache replay (${history.length + 1} historical reading(s)); ` +
             `no live frame.`,
         );
-        resolve({ reading: latest, adapter, history: history.snapshot() });
-        return;
-      }
-      const held = hold.heldReading;
-      if (held) {
-        finishWith(held);
-        return;
+        const raw: RawReading = { reading: latest, adapter, history: history.snapshot() };
+        resolve(raw);
+        return raw;
       }
       const r = lastCaptureReading;
       if (capture.enabled && r) {
@@ -665,13 +651,24 @@ export function waitForRawReading(
         resolved = true;
         init.cleanup();
         process.stdout.write('\r' + ' '.repeat(80) + '\r');
-        bleLog.info('Capture mode: scale disconnected; recorded frames above. Returning reading.');
-        resolve({ reading: r, adapter, history: undefined });
-        return;
+        const why = cause === DISCONNECTED ? 'scale disconnected' : cause;
+        bleLog.info(`Capture mode: ${why}; recorded frames above. Returning reading.`);
+        const raw: RawReading = { reading: r, adapter, history: undefined };
+        resolve(raw);
+        return raw;
       }
+      // Latch before cleaning up. Without this a notification arriving after an
+      // abandoned session is still parsed, and the capture/hold timers above
+      // would treat the session as live.
+      resolved = true;
       init.cleanup();
       reject(new Error('Scale disconnected before reading completed'));
+      return undefined;
+    };
+    bleDevice.onDisconnect(() => {
+      endSession(DISCONNECTED);
     });
+    sessionEnders.set(bleDevice, endSession);
 
     // Subscribe to notifications and start adapter init.
     // Errors are caught and forwarded to the Promise's reject.
@@ -684,6 +681,11 @@ export function waitForRawReading(
       init.register,
     ).catch((e) => {
       if (!resolved) {
+        // Latch, like the other settle paths. Without it a fireDisconnect()
+        // from the caller's abandonment cleanup walks the whole disconnect
+        // cascade again and can log "Reading complete" for a session whose
+        // init failed, if a frame happened to arrive before the failure.
+        resolved = true;
         hold.clear();
         clearCaptureHold();
         init.cleanup();
@@ -691,34 +693,4 @@ export function waitForRawReading(
       }
     });
   });
-}
-
-/**
- * Subscribe to GATT notifications and wait for a complete scale reading.
- * Wrapper around waitForRawReading() that computes body composition metrics.
- * Shared by both the node-ble (Linux) and noble (Windows/macOS) handlers.
- *
- * NOTE: this wrapper flattens to a single BodyComposition. Any history
- * collected during the GATT session is discarded. Callers that need
- * historical replay must use waitForRawReading and feed the orchestrator the
- * full RawReading.
- */
-export function waitForReading(
-  charMap: Map<string, BleChar>,
-  bleDevice: BleDevice,
-  adapter: ScaleAdapter,
-  profile: UserProfile,
-  deviceAddress: string,
-  weightUnit?: WeightUnit,
-  onLiveData?: (reading: ScaleReading) => void,
-): Promise<BodyComposition> {
-  return waitForRawReading(
-    charMap,
-    bleDevice,
-    adapter,
-    profile,
-    deviceAddress,
-    weightUnit,
-    onLiveData,
-  ).then(({ reading, adapter: matched }) => matched.computeMetrics(reading, profile));
 }

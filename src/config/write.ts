@@ -1,4 +1,13 @@
-import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  existsSync,
+  chmodSync,
+  lstatSync,
+  realpathSync,
+} from 'node:fs';
 import { parseDocument } from 'yaml';
 import { createLogger } from '../logger.js';
 import { errMsg } from '../utils/error.js';
@@ -8,22 +17,70 @@ const log = createLogger('ConfigWrite');
 // --- Atomic file write ---
 
 /**
+ * Mode for files this module writes.
+ *
+ * config.yaml holds the Garmin password and every exporter token in plaintext,
+ * so the wizard chmods it to 0600 after saving. The rename below replaces the
+ * file, and with it the mode: without an explicit mode the tmp file is created
+ * 0666 & ~umask, i.e. usually 0644, and that mode is what survives. The wizard
+ * only chmods once, at save time, but updateLastKnownWeight() calls this on
+ * every non-dry weigh-in - so the first export after setup silently made the
+ * credentials world-readable, permanently. The tmp file needs it too: it holds
+ * the same content, briefly, under a predictable name.
+ */
+const SECRET_FILE_MODE = 0o600;
+
+/**
  * Write content to a file atomically via tmp+rename.
  * Falls back to direct overwrite when the target is a Docker bind mount
  * (which cannot be unlinked/renamed over — EBUSY).
+ *
+ * The rename REPLACES the target; the original is never unlinked first. It used
+ * to be, and a rename that then failed with anything outside the fallback list
+ * (ENOSPC, EIO) left no target at all - and the outer cleanup removed the tmp
+ * copy too, so both were gone. Since v1.29.0 this also carries the export retry
+ * queue, so that was not only a config-file risk. libuv renames with
+ * MOVEFILE_REPLACE_EXISTING on Windows, so replacing in place is not
+ * POSIX-only; EEXIST is handled below for any filesystem that refuses anyway.
  */
-export function atomicWrite(filePath: string, content: string): void {
+export function atomicWrite(linkOrFilePath: string, content: string): void {
+  // rename(2) replaces the directory entry it is given, so renaming onto a
+  // symlinked config.yaml replaced the LINK with a plain file: the first
+  // last_known_weight write cut the link and later edits of the real file
+  // were never read again. Write beside the file the link points at instead.
+  const filePath = resolveSymlink(linkOrFilePath);
   const tmpPath = filePath + '.tmp';
   try {
-    writeFileSync(tmpPath, content, 'utf8');
+    // A stale tmp from an earlier interrupted write must not be reused:
+    // writeFileSync applies `mode` only when it CREATES the file, so a leftover
+    // 0644 tmp would keep those permissions and the rename would carry them
+    // onto a file holding the Garmin password. Remove it, then create
+    // exclusively - if something recreates it in between, 'wx' fails loudly
+    // rather than silently widening the mode.
     try {
-      if (existsSync(filePath)) unlinkSync(filePath);
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {
+      // Best effort; the 'wx' below is what actually guarantees the mode.
+    }
+    writeFileSync(tmpPath, content, { encoding: 'utf8', mode: SECRET_FILE_MODE, flag: 'wx' });
+    try {
       renameSync(tmpPath, filePath);
     } catch (renameErr: unknown) {
       const code = renameErr instanceof Error ? (renameErr as NodeJS.ErrnoException).code : '';
-      if (code === 'EBUSY' || code === 'EPERM' || code === 'EXDEV') {
-        // Docker bind mount, Windows EPERM, cross-device rename: overwrite directly
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'EXDEV' || code === 'EEXIST') {
+        // Docker bind mount, Windows EPERM, cross-device rename, or a
+        // filesystem that will not rename over an existing file: overwrite
+        // directly. Not atomic, and deliberately so - the alternative is
+        // refusing to write at all on the documented single-file mount.
         writeFileSync(filePath, content, 'utf8');
+        // writeFileSync applies `mode` only when it CREATES the file, and this
+        // branch exists precisely because the target already exists. The rename
+        // path above needs no chmod: it carries the tmp file's mode with it.
+        try {
+          chmodSync(filePath, SECRET_FILE_MODE);
+        } catch {
+          // Best effort: some filesystems (and Windows) do not honour it.
+        }
         try {
           unlinkSync(tmpPath);
         } catch {
@@ -41,6 +98,16 @@ export function atomicWrite(filePath: string, content: string): void {
       // ignore cleanup failure
     }
     throw err;
+  }
+}
+
+/** The real path behind a symlink; the path itself when it is none or missing. */
+function resolveSymlink(path: string): string {
+  try {
+    return lstatSync(path).isSymbolicLink() ? realpathSync(path) : path;
+  } catch {
+    // Missing (first write) or a dangling link: keep the old behaviour.
+    return path;
   }
 }
 
@@ -70,6 +137,7 @@ export function _resetWriteLock(): void {
 // --- Self-write suppress window (used by config watcher to ignore our own writes) ---
 
 let suppressedUntil = 0;
+let selfWrittenContent: string | null = null;
 
 /**
  * Mark the next `ms` milliseconds as a self-write window. The config watcher
@@ -81,14 +149,39 @@ export function setSuppressReloadWindow(ms = 2000): void {
   suppressedUntil = Date.now() + ms;
 }
 
+/**
+ * Record the exact bytes a self-write is about to put on disk.
+ *
+ * A time window alone cannot tell our own write from anybody else's. The
+ * watcher used to drop every change inside it, and because it had already
+ * advanced its `lastContent` when the event arrived, a real edit landing in
+ * that window was gone for good: no later event looked like a change, so the
+ * operator's edit never took effect until a restart or a SIGHUP. Comparing the
+ * content instead distinguishes them exactly, with no reload loop and nothing
+ * discarded.
+ */
+export function noteSelfWrite(content: string, ms = 2000): void {
+  suppressedUntil = Date.now() + ms;
+  selfWrittenContent = content;
+}
+
 /** True when a recent self-write should suppress a reload trigger. */
 export function isReloadSuppressed(): boolean {
   return Date.now() < suppressedUntil;
 }
 
+/**
+ * True when `content` is exactly what this process just wrote, and recently
+ * enough for that to still be the explanation.
+ */
+export function isSelfWrite(content: string | null): boolean {
+  return isReloadSuppressed() && content !== null && content === selfWrittenContent;
+}
+
 /** Reset the suppress window (for tests). */
 export function _resetSuppressWindow(): void {
   suppressedUntil = 0;
+  selfWrittenContent = null;
 }
 
 // --- Last known weight writer (sync, testable) ---
@@ -126,7 +219,11 @@ export function writeLastKnownWeight(configPath: string, userSlug: string, weigh
     return;
   }
 
-  atomicWrite(configPath, doc.toString());
+  const next = doc.toString();
+  // Register the bytes before they land: the watcher compares against these to
+  // tell our own bump from an edit somebody made in the same two seconds.
+  noteSelfWrite(next);
+  atomicWrite(configPath, next);
 }
 
 // --- Debounced async updater ---

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type {
   ScaleAdapter,
@@ -7,6 +8,7 @@ import type {
   UserProfile,
   BleDeviceInfo,
 } from '../../src/interfaces/scale-adapter.js';
+import { makeBodyComposition } from '../helpers/scale-test-utils.js';
 import type { EsphomeProxyConfig } from '../../src/config/schema.js';
 
 // Suppress log output
@@ -80,10 +82,8 @@ function makeBroadcastAdapter(): ScaleAdapter {
       data.length >= 2 ? { weight: 75.5, impedance: 400 } : null,
     ) as ScaleAdapter['parseBroadcast'],
     isComplete: (r: ScaleReading): boolean => r.weight > 0,
-    computeMetrics: (r: ScaleReading): BodyComposition => ({
-      weight: r.weight,
-      impedance: r.impedance,
-    }),
+    computeMetrics: (r: ScaleReading): BodyComposition =>
+      makeBodyComposition({ weight: r.weight, impedance: r.impedance }),
     parseNotification: () => null,
     // broadcast-only scale: no GATT UUIDs
     charNotifyUuid: undefined as unknown as string,
@@ -122,10 +122,8 @@ function makePassiveAdapter(
       }
     }) as ScaleAdapter['parseServiceData'],
     isComplete: (r: ScaleReading): boolean => r.weight > 0 && r.impedance > 0,
-    computeMetrics: (r: ScaleReading): BodyComposition => ({
-      weight: r.weight,
-      impedance: r.impedance,
-    }),
+    computeMetrics: (r: ScaleReading): BodyComposition =>
+      makeBodyComposition({ weight: r.weight, impedance: r.impedance }),
     parseNotification: () => null,
     charNotifyUuid: undefined as unknown as string,
     charWriteUuid: undefined as unknown as string,
@@ -139,10 +137,8 @@ function makeGattOnlyAdapter(): ScaleAdapter {
     name: 'MockGattOnly',
     matches: vi.fn((info: BleDeviceInfo) => info.localName === 'GATT-scale'),
     isComplete: (r: ScaleReading): boolean => r.weight > 0,
-    computeMetrics: (r: ScaleReading): BodyComposition => ({
-      weight: r.weight,
-      impedance: r.impedance,
-    }),
+    computeMetrics: (r: ScaleReading): BodyComposition =>
+      makeBodyComposition({ weight: r.weight, impedance: r.impedance }),
     parseNotification: () => null,
     charNotifyUuid: '0000ffe1-0000-1000-8000-00805f9b34fb',
     charWriteUuid: '0000ffe2-0000-1000-8000-00805f9b34fb',
@@ -162,10 +158,8 @@ function makeDualModeAdapter(): ScaleAdapter {
     matches: vi.fn((info: BleDeviceInfo) => info.localName === 'DualMode-scale'),
     parseBroadcast: vi.fn((): ScaleReading | null => null) as ScaleAdapter['parseBroadcast'],
     isComplete: (r: ScaleReading): boolean => r.weight > 0,
-    computeMetrics: (r: ScaleReading): BodyComposition => ({
-      weight: r.weight,
-      impedance: r.impedance,
-    }),
+    computeMetrics: (r: ScaleReading): BodyComposition =>
+      makeBodyComposition({ weight: r.weight, impedance: r.impedance }),
     parseNotification: () => null,
     charNotifyUuid: '0000fff1-0000-1000-8000-00805f9b34fb',
     charWriteUuid: '0000fff2-0000-1000-8000-00805f9b34fb',
@@ -236,7 +230,7 @@ describe('transport capability summary (#116)', () => {
     vi.clearAllMocks();
   });
 
-  const summaryLines = (logSpy: ReturnType<typeof vi.spyOn>): string[] =>
+  const summaryLines = (logSpy: MockInstance<typeof console.log>): string[] =>
     logSpy.mock.calls
       .map((c) => String(c[0]))
       .filter((s) => /ESPHome proxy transport ready \(broadcast \+ GATT\)/.test(s));
@@ -571,6 +565,119 @@ describe('scanAndReadRaw, grace timer (passive scan)', () => {
     const result = await promise;
     expect(result.reading.weight).toBe(70.0);
     expect(result.reading.impedance).toBe(0);
+  });
+
+  // #357: a weigh-in held when the 60 s scan deadline fires is neither dropped
+  // nor resolved at the deadline. The scan keeps listening until a complete
+  // frame arrives or the reading's own grace runs out, so a Mi Scale 2 whose
+  // impedance frame lands just after the deadline keeps it.
+  describe('deadline during a hold (#357)', () => {
+    const HELD_AT_MS = 55_000; // 5 s before the deadline, so 7 s of grace remain after it
+
+    async function startHeldScan(
+      mode: 'partial-then-complete' | 'always-partial',
+      extra: Partial<
+        Parameters<typeof import('../../src/ble/handler-esphome-proxy/index.js').scanAndReadRaw>[0]
+      > = {},
+    ) {
+      vi.useFakeTimers({
+        toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+      });
+      const { scanAndReadRaw } = await import('../../src/ble/handler-esphome-proxy/index.js');
+      const promise = scanAndReadRaw({
+        adapters: [makePassiveAdapter(mode), makeGattOnlyAdapter()],
+        profile,
+        esphomeProxy: config,
+        bleHandler: 'esphome-proxy',
+        ...extra,
+      });
+      const state: {
+        settled: boolean;
+        ok?: boolean;
+        r?: Awaited<typeof promise>;
+        e?: unknown;
+      } = { settled: false };
+      const outcome = promise.then(
+        (r) => Object.assign(state, { settled: true, ok: true, r }),
+        (e: unknown) => Object.assign(state, { settled: true, ok: false, e }),
+      );
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      await vi.advanceTimersByTimeAsync(HELD_AT_MS);
+      pushPassiveAd(); // weight only: held
+      await vi.advanceTimersByTimeAsync(6_000); // 1 s past the deadline
+      return { state, outcome };
+    }
+
+    it('a complete frame after the deadline resolves with its impedance', async () => {
+      const { state, outcome } = await startHeldScan('partial-then-complete');
+      expect(state.settled).toBe(false);
+      pushPassiveAd(); // weight + impedance
+      await outcome;
+      expect(state.ok).toBe(true);
+      expect(state.r?.reading).toEqual({ weight: 70.0, impedance: 500 });
+    });
+
+    it('with no complete frame, resolves weight only when the grace runs out, not at the deadline', async () => {
+      const { IMPEDANCE_GRACE_MS } = await import('../../src/ble/types.js');
+      const { state, outcome } = await startHeldScan('always-partial');
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(IMPEDANCE_GRACE_MS - 6_000 - 100);
+      expect(state.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(200);
+      await outcome;
+      expect(state.ok).toBe(true);
+      expect(state.r?.reading).toEqual({ weight: 70.0, impedance: 0 });
+    });
+
+    it('an abort while holding past the deadline rejects and resolves nothing', async () => {
+      const { IMPEDANCE_GRACE_MS } = await import('../../src/ble/types.js');
+      const ac = new AbortController();
+      const { state, outcome } = await startHeldScan('always-partial', {
+        abortSignal: ac.signal,
+      });
+      ac.abort(new Error('shutdown'));
+      await outcome;
+      expect(state.ok).toBe(false);
+      expect((state.e as Error).message).toBe('shutdown');
+      await vi.advanceTimersByTimeAsync(IMPEDANCE_GRACE_MS);
+      expect(state.ok).toBe(false);
+    });
+
+    it('a GATT failure while holding past the deadline still rejects', async () => {
+      const { state, outcome } = await startHeldScan('always-partial');
+      mockClient.pushBle({
+        address: 0xaabbccddeeff,
+        name: 'GATT-scale',
+        rssi: -60,
+        serviceUuidsList: [],
+        serviceDataList: [],
+        manufacturerDataList: [],
+        addressType: 0,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      await outcome;
+      expect(state.ok).toBe(false);
+      expect((state.e as Error).message).toMatch(/GATT/);
+    });
+  });
+
+  it('deadline with nothing held: rejects as before', async () => {
+    vi.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+    });
+    const { scanAndReadRaw } = await import('../../src/ble/handler-esphome-proxy/index.js');
+    const promise = scanAndReadRaw({
+      adapters: [makePassiveAdapter('always-partial')],
+      profile,
+      esphomeProxy: config,
+      bleHandler: 'esphome-proxy',
+    });
+    const assertion = expect(promise).rejects.toThrow(/Timed out waiting for any recognized scale/);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await vi.advanceTimersByTimeAsync(60_100);
+    await assertion;
   });
 });
 
